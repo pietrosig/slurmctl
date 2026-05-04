@@ -447,7 +447,17 @@ def discover_real_sbatch() -> str | None:
 def make_wrapper(wrapper_dir: Path) -> Path:
     wrapper = wrapper_dir / "sbatch"
     python = sys.executable or shutil.which("python3") or "python3"
-    wrapper.write_text(f"#!{python}\n{WRAPPER_CODE}", encoding="utf-8")
+    launcher = """#!/bin/sh
+''':'
+py="${SLURMCTL_PYTHON:-%s}"
+"$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || {
+    echo "slurmctl sbatch wrapper: Python 3.11+ is required" >&2
+    exit 127
+}
+exec "$py" "$0" "$@"
+':'''
+""" % python
+    wrapper.write_text(f"{launcher}{WRAPPER_CODE}", encoding="utf-8")
     mode = wrapper.stat().st_mode
     wrapper.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return wrapper
@@ -479,6 +489,7 @@ def run_script(args: argparse.Namespace) -> int:
         env["SLURMCTL_DIR"] = str(slurmctl_dir_abs)
         env["SLURMCTL_DRY_RUN"] = "1" if args.dry_run else "0"
         env["SLURMCTL_VERBOSE"] = "1" if args.verbose else "0"
+        env["SLURMCTL_PYTHON"] = sys.executable
         if real_sbatch:
             env["SLURMCTL_REAL_SBATCH"] = real_sbatch
 
@@ -523,6 +534,7 @@ def run_sbatch_args(
         env["SLURMCTL_DIR"] = str(slurmctl_dir_abs)
         env["SLURMCTL_DRY_RUN"] = "1" if dry_run else "0"
         env["SLURMCTL_VERBOSE"] = "1" if verbose else "0"
+        env["SLURMCTL_PYTHON"] = sys.executable
         if real_sbatch:
             env["SLURMCTL_REAL_SBATCH"] = real_sbatch
         cwd = submit_cwd if submit_cwd and Path(submit_cwd).exists() else None

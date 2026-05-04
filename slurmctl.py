@@ -13,6 +13,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import time
 from pathlib import Path
 
 
@@ -688,6 +689,10 @@ class InteractiveShell:
         self.search_active = False
         self.selected = 0
         self.message = ""
+        self.watch_cache: list[dict] = []
+        self.watch_source = "not loaded"
+        self.watch_loaded_at = 0.0
+        self.watch_ttl_seconds = 5.0
         self.home_items = [
             {"name": "run", "detail": "Run a script with sbatch interception"},
             {"name": "show", "detail": "Browse captured submissions"},
@@ -732,7 +737,7 @@ class InteractiveShell:
         )
 
     def filtered_watch_jobs(self) -> list[dict]:
-        jobs, _source = load_watch_jobs(self.args.slurmctl_dir)
+        jobs, _source = self.get_watch_jobs()
         return self.filter_items(
             jobs,
             lambda item: " ".join(
@@ -754,6 +759,13 @@ class InteractiveShell:
         if not needle:
             return items
         return [item for item in items if needle in text_fn(item).lower()]
+
+    def get_watch_jobs(self, *, force: bool = False) -> tuple[list[dict], str]:
+        now = time.monotonic()
+        if force or now - self.watch_loaded_at >= self.watch_ttl_seconds:
+            self.watch_cache, self.watch_source = load_watch_jobs(self.args.slurmctl_dir)
+            self.watch_loaded_at = now
+        return self.watch_cache, self.watch_source
 
     def clamp_selected(self, count: int) -> None:
         if count <= 0:
@@ -817,7 +829,7 @@ class InteractiveShell:
         if self.view == "show":
             context = f"{len(self.filtered_submissions())} shown / {len(load_submissions(self.args.slurmctl_dir))} total"
         elif self.view == "watch":
-            jobs, source = load_watch_jobs(self.args.slurmctl_dir)
+            jobs, source = self.get_watch_jobs()
             context = f"{len(self.filtered_watch_jobs())} shown / {len(jobs)} total | {source}"
         elif self.view == "run":
             context = f"{len(self.filtered_scripts())} scripts"
@@ -1009,6 +1021,10 @@ class InteractiveShell:
             return False
         if key == ord("q") and not self.search_active:
             return True
+        if key in (ord("r"), ord("R")) and self.view == "watch":
+            self.get_watch_jobs(force=True)
+            self.message = f"Refreshed watch from {self.watch_source}"
+            return False
         if key in (ord("b"), ord("B")):
             self.go_back()
             return False

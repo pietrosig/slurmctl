@@ -158,6 +158,9 @@ In `watch`, selecting a job opens similar actions plus:
 
 - `C`: cancel a live Slurm job
 
+The interactive `watch` view caches `squeue` results briefly so large job lists
+do not make every redraw slow. Press `R` in the watch list to refresh manually.
+
 Cancel is guarded: you must type `CANCEL` and press Enter before `scancel` is
 called. With `--dry-run`, cancel only reports what would happen.
 

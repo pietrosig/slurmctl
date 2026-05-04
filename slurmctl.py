@@ -687,7 +687,7 @@ class InteractiveShell:
         self.view = "home"
         self.query = ""
         self.search_active = False
-        self.selected = 0
+        self.reset_selection()
         self.message = ""
         self.watch_cache: list[dict] = []
         self.watch_source = "not loaded"
@@ -769,9 +769,26 @@ class InteractiveShell:
 
     def clamp_selected(self, count: int) -> None:
         if count <= 0:
-            self.selected = 0
+            self.reset_selection()
         else:
             self.selected = max(0, min(self.selected, count - 1))
+
+    def visible_slice(self, items: list[dict], max_rows: int) -> tuple[int, list[dict]]:
+        max_rows = max(0, max_rows)
+        if max_rows <= 0 or not items:
+            self.scroll_top = 0
+            return 0, []
+        if self.selected < self.scroll_top:
+            self.scroll_top = self.selected
+        if self.selected >= self.scroll_top + max_rows:
+            self.scroll_top = self.selected - max_rows + 1
+        max_top = max(0, len(items) - max_rows)
+        self.scroll_top = max(0, min(self.scroll_top, max_top))
+        return self.scroll_top, items[self.scroll_top : self.scroll_top + max_rows]
+
+    def reset_selection(self) -> None:
+        self.selected = 0
+        self.scroll_top = 0
 
     def draw(self) -> None:
         assert self.screen is not None
@@ -850,16 +867,20 @@ class InteractiveShell:
     def draw_home(self, height: int, width: int) -> None:
         items = self.filtered_home()
         self.clamp_selected(len(items))
-        for idx, item in enumerate(items[: max(0, height - 3)]):
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+        start, visible = self.visible_slice(items, height - 3)
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             self.add(idx + 2, 2, f"{item['name']:<8} {item['detail']}"[: width - 4], attr)
 
     def draw_run(self, height: int, width: int) -> None:
         items = self.filtered_scripts()
         self.clamp_selected(len(items))
         self.add(2, 2, "Enter runs the selected script, or the typed path if there is no match."[: width - 4])
-        for idx, item in enumerate(items[: max(0, height - 5)]):
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+        start, visible = self.visible_slice(items, height - 5)
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             self.add(idx + 4, 2, item["path"][: width - 4], attr)
 
     def draw_show(self, height: int, width: int) -> None:
@@ -867,8 +888,10 @@ class InteractiveShell:
         self.clamp_selected(len(items))
         header = f"{'JOB_ID':<8} {'HASH':<16} {'SCRIPT':<22} {'OUT':<24} ERR"
         self.add(2, 0, header[: width - 1], curses.A_BOLD)
-        for idx, item in enumerate(items[: max(0, height - 4)]):
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+        start, visible = self.visible_slice(items, height - 4)
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             row = (
                 f"{item.get('job_id') or '-':<8} "
                 f"{item.get('command_hash') or '-':<16} "
@@ -883,8 +906,10 @@ class InteractiveShell:
         self.clamp_selected(len(items))
         header = f"{'JOB_ID':<8} {'STATE':<12} {'ELAPSED':<10} {'NODES':<6} {'NAME':<22} REASON"
         self.add(2, 0, header[: width - 1], curses.A_BOLD)
-        for idx, item in enumerate(items[: max(0, height - 4)]):
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+        start, visible = self.visible_slice(items, height - 4)
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             row = (
                 f"{item.get('job_id') or '-':<8} "
                 f"{item.get('state') or '-':<12} "
@@ -940,8 +965,10 @@ class InteractiveShell:
         items = self.settings_items()
         self.clamp_selected(len(items))
         self.add(2, 2, "Enter edits the selected setting. Empty editor means environment/default fallback."[: width - 4])
-        for idx, item in enumerate(items[: max(0, height - 5)]):
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+        start, visible = self.visible_slice(items, height - 5)
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             row = f"{item['name']:<18} {item['value']:<32} {item['detail']}"
             self.add(idx + 4, 2, row[: width - 4], attr)
 
@@ -950,8 +977,10 @@ class InteractiveShell:
         self.add(2, 2, f"Selected: {record.get('job_id') or '-'} {record.get('script_path') or '-'}"[: width - 4])
         items = self.action_items()
         self.clamp_selected(len(items))
-        for idx, item in enumerate(items[: max(0, height - 5)]):
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+        start, visible = self.visible_slice(items, height - 5)
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             self.add(idx + 4, 2, f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4], attr)
 
     def draw_watch_actions(self, height: int, width: int) -> None:
@@ -965,8 +994,10 @@ class InteractiveShell:
             self.add(3, 2, "Type CANCEL in the bottom bar and press Enter to cancel this job."[: width - 4], curses.A_BOLD)
         items = self.watch_action_items()
         self.clamp_selected(len(items))
-        for idx, item in enumerate(items[: max(0, height - 6)]):
-            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+        start, visible = self.visible_slice(items, height - 6)
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             self.add(idx + 5, 2, f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4], attr)
 
     def draw_viewer(self, height: int, width: int) -> None:
@@ -1011,13 +1042,13 @@ class InteractiveShell:
         if self.search_active:
             if key in (curses.KEY_BACKSPACE, 127, 8, curses.KEY_DC, curses.KEY_LEFT):
                 self.query = self.query[:-1]
-                self.selected = 0
+                self.reset_selection()
                 return False
             if key == curses.KEY_RESIZE:
                 return False
             if 32 <= key <= 126:
                 self.query += chr(key)
-                self.selected = 0
+                self.reset_selection()
             return False
         if key == ord("q") and not self.search_active:
             return True
@@ -1063,7 +1094,7 @@ class InteractiveShell:
             self.editing_setting = None
         self.query = ""
         self.search_active = False
-        self.selected = 0
+        self.reset_selection()
         self.message = ""
 
     def activate(self) -> None:
@@ -1080,7 +1111,7 @@ class InteractiveShell:
             self.view = items[self.selected]["name"]
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
             self.message = ""
             return
         if self.view == "run":
@@ -1094,7 +1125,7 @@ class InteractiveShell:
             self.view = "actions"
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
             return
         if self.view == "watch":
             items = self.filtered_watch_jobs()
@@ -1105,7 +1136,7 @@ class InteractiveShell:
             self.view = "watch_actions"
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
             return
         if self.view == "actions":
             items = self.action_items()
@@ -1121,7 +1152,7 @@ class InteractiveShell:
             self.view = "actions"
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
             return
         if self.view == "settings":
             items = self.settings_items()
@@ -1164,14 +1195,14 @@ class InteractiveShell:
             self.view = "show"
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
             return
         if key == "D":
             delete_submission(record, self.args.slurmctl_dir)
             self.view = "show"
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
             self.message = f"Deleted run {record.get('run_id') or ''}".strip()
             return
         if key == "R":
@@ -1196,7 +1227,7 @@ class InteractiveShell:
             self.view = "watch"
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
             self.confirm_cancel = False
             return
         submission = job.get("submission") or self.find_submission_for_job(job.get("job_id"))
@@ -1250,7 +1281,7 @@ class InteractiveShell:
         self.query = ""
         self.search_active = False
         self.view = "watch"
-        self.selected = 0
+        self.reset_selection()
 
     def find_submission_for_job(self, job_id: object) -> dict | None:
         if not job_id:
@@ -1284,7 +1315,7 @@ class InteractiveShell:
             self.message = f"Editor exited with {code}: {resolved}"
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
         finally:
             curses.reset_prog_mode()
             self.screen.keypad(True)
@@ -1303,7 +1334,7 @@ class InteractiveShell:
         self.editing_setting = None
         self.query = ""
         self.search_active = False
-        self.selected = 0
+        self.reset_selection()
         self.message = f"Saved {key} in {config_path()}"
 
     def suspend_and_run(self, command_argv: list[str], *, rerender_message: str) -> None:
@@ -1342,7 +1373,7 @@ class InteractiveShell:
             self.view = return_view
             self.query = ""
             self.search_active = False
-            self.selected = 0
+            self.reset_selection()
             self.message = f"Reran {record.get('script_path') or 'submission'}"
         finally:
             curses.reset_prog_mode()

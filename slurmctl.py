@@ -604,6 +604,35 @@ def editor_command(configured: str | None = None) -> list[str]:
     return ["vi"]
 
 
+def resolve_from_cwd(path_text: str) -> Path:
+    path = Path(path_text)
+    return path if path.is_absolute() else (Path.cwd() / path).resolve()
+
+
+def has_slurmctl_data(path: Path) -> bool:
+    return (
+        (path / "submissions.jsonl").exists()
+        or (path / "runs").exists()
+        or (path / "commands").exists()
+    )
+
+
+def move_slurmctl_data(old_dir: Path, new_dir: Path) -> None:
+    new_dir.mkdir(parents=True, exist_ok=True)
+    for name in ("submissions.jsonl", "runs", "commands"):
+        source = old_dir / name
+        target = new_dir / name
+        if not source.exists():
+            continue
+        if target.exists():
+            raise FileExistsError(f"target already exists: {target}")
+        shutil.move(str(source), str(target))
+    try:
+        old_dir.rmdir()
+    except OSError:
+        pass
+
+
 def show(args: argparse.Namespace) -> int:
     slurmctl_dir = Path(args.slurmctl_dir)
     submissions = slurmctl_dir / "submissions.jsonl"
@@ -703,6 +732,7 @@ class InteractiveShell:
         self.settings = load_settings()
         self.editing_setting: str | None = None
         self.confirm_cancel = False
+        self.pending_slurmctl_dir: str | None = None
         self.screen: curses.window | None = None
         self.view = "home"
         self.query = ""
@@ -1112,6 +1142,7 @@ class InteractiveShell:
         elif self.view == "settings":
             self.view = "home"
             self.editing_setting = None
+            self.pending_slurmctl_dir = None
         self.query = ""
         self.search_active = False
         self.reset_selection()
@@ -1120,6 +1151,9 @@ class InteractiveShell:
     def activate(self) -> None:
         if self.view == "settings" and self.editing_setting:
             self.save_active_setting()
+            return
+        if self.view == "settings" and self.pending_slurmctl_dir is not None:
+            self.finish_slurmctl_dir_change()
             return
         if self.view == "watch_actions" and self.confirm_cancel:
             self.confirm_cancel_action()
@@ -1347,6 +1381,17 @@ class InteractiveShell:
         value = self.query.strip()
         if key == "slurmctl_dir" and not value:
             value = ".slurmctl"
+        if key == "slurmctl_dir":
+            old_value = self.args.slurmctl_dir
+            old_dir = resolve_from_cwd(old_value)
+            new_dir = resolve_from_cwd(value)
+            if old_dir != new_dir and has_slurmctl_data(old_dir):
+                self.pending_slurmctl_dir = value
+                self.editing_setting = None
+                self.query = ""
+                self.search_active = True
+                self.message = f"Move data from {old_dir} to {new_dir}? Type MOVE or SKIP, then Enter."
+                return
         self.settings[key] = value
         save_settings(self.settings)
         if key == "slurmctl_dir":
@@ -1356,6 +1401,33 @@ class InteractiveShell:
         self.search_active = False
         self.reset_selection()
         self.message = f"Saved {key} in {config_path()}"
+
+    def finish_slurmctl_dir_change(self) -> None:
+        value = self.pending_slurmctl_dir
+        if value is None:
+            return
+        answer = self.query.strip().upper()
+        if answer not in {"MOVE", "SKIP"}:
+            self.message = "Type MOVE to move current data, or SKIP to only change the setting."
+            return
+        old_dir = resolve_from_cwd(self.args.slurmctl_dir)
+        new_dir = resolve_from_cwd(value)
+        if answer == "MOVE":
+            try:
+                move_slurmctl_data(old_dir, new_dir)
+            except OSError as exc:
+                self.message = f"Move failed: {exc}"
+                self.query = ""
+                return
+        self.settings["slurmctl_dir"] = value
+        save_settings(self.settings)
+        self.args.slurmctl_dir = value
+        self.pending_slurmctl_dir = None
+        self.query = ""
+        self.search_active = False
+        self.reset_selection()
+        moved = "moved data and " if answer == "MOVE" else ""
+        self.message = f"{moved}saved slurmctl_dir in {config_path()}"
 
     def suspend_and_run(self, command_argv: list[str], *, rerender_message: str) -> None:
         assert self.screen is not None

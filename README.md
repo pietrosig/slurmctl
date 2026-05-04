@@ -26,6 +26,10 @@ curl -fsSL https://raw.githubusercontent.com/pietrosig/slurmctl/main/slurmctl.py
 chmod +x ~/.local/bin/slurmctl
 ```
 
+The installed `slurmctl` launcher looks for `python3.13`, `python3.12`,
+`python3.11`, then `python3`, and only uses an interpreter if it is Python
+3.11+. You can force a specific interpreter with `SLURMCTL_PYTHON`.
+
 Make sure `~/.local/bin` is on your `PATH`:
 
 ```bash

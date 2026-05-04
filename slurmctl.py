@@ -1,5 +1,13 @@
-#!/usr/bin/env python3
-"""Minimal dependency-free sbatch interception CLI."""
+#!/bin/sh
+''':'
+for py in "${SLURMCTL_PYTHON:-}" python3.13 python3.12 python3.11 python3; do
+    [ -n "$py" ] || continue
+    "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || continue
+    exec "$py" "$0" "$@"
+done
+echo "slurmctl: Python 3.11+ is required" >&2
+exit 127
+':'''
 
 from __future__ import annotations
 
@@ -17,8 +25,7 @@ import time
 from pathlib import Path
 
 
-WRAPPER_CODE = r'''#!/usr/bin/env python3
-from __future__ import annotations
+WRAPPER_CODE = r'''from __future__ import annotations
 
 import datetime as _dt
 import fcntl
@@ -439,7 +446,8 @@ def discover_real_sbatch() -> str | None:
 
 def make_wrapper(wrapper_dir: Path) -> Path:
     wrapper = wrapper_dir / "sbatch"
-    wrapper.write_text(WRAPPER_CODE, encoding="utf-8")
+    python = sys.executable or shutil.which("python3") or "python3"
+    wrapper.write_text(f"#!{python}\n{WRAPPER_CODE}", encoding="utf-8")
     mode = wrapper.stat().st_mode
     wrapper.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
     return wrapper
@@ -1384,6 +1392,7 @@ def doctor(args: argparse.Namespace) -> int:
     real_sbatch = discover_real_sbatch()
     settings = load_settings()
     print(f"PATH: {os.environ.get('PATH', '')}")
+    print(f"python: {sys.executable}")
     print(f"sbatch: {real_sbatch or 'not found'}")
     print(f"squeue: {shutil.which('squeue') or 'not found'}")
     print(f"scancel: {shutil.which('scancel') or 'not found'}")

@@ -15,13 +15,16 @@ import argparse
 import curses
 import json
 import os
+import queue
 import shlex
 import shutil
 import stat
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+from dataclasses import dataclass
 from pathlib import Path
 
 
@@ -380,6 +383,15 @@ DEFAULT_SETTINGS = {
 }
 
 
+@dataclass(frozen=True)
+class WatchRefreshResult:
+    token: int
+    jobs: list[dict]
+    source: str
+    loaded_at: float
+    error: str = ""
+
+
 def config_path() -> Path:
     config_home = os.environ.get("XDG_CONFIG_HOME")
     if config_home:
@@ -656,11 +668,15 @@ def show(args: argparse.Namespace) -> int:
     return 0
 
 
-def load_watch_jobs(slurmctl_dir: str) -> tuple[list[dict], str]:
+def load_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = None) -> tuple[list[dict], str]:
     squeue = shutil.which("squeue")
     if squeue:
         command = [squeue, "--me", "--noheader", "--format=%i|%j|%T|%M|%D|%R"]
-        proc = subprocess.run(command, text=True, capture_output=True)
+        try:
+            proc = subprocess.run(command, text=True, capture_output=True, timeout=timeout_seconds)
+        except subprocess.TimeoutExpired:
+            timeout_text = f"{timeout_seconds:g}s" if timeout_seconds is not None else "unknown timeout"
+            return [], f"squeue timed out after {timeout_text}"
         if proc.returncode == 0:
             jobs = []
             for line in proc.stdout.splitlines():
@@ -739,10 +755,23 @@ class InteractiveShell:
         self.search_active = False
         self.reset_selection()
         self.message = ""
+        self.dirty = True
         self.watch_cache: list[dict] = []
         self.watch_source = "not loaded"
+        self.watch_error = ""
         self.watch_loaded_at = 0.0
-        self.watch_ttl_seconds = 5.0
+        self.watch_refresh_interval_seconds = 2.0
+        self.watch_timeout_seconds = 3.0
+        self.watch_refreshing = False
+        self.watch_refresh_announce = False
+        self.watch_next_token = 0
+        self.watch_active_token = 0
+        self.watch_results: queue.SimpleQueue[WatchRefreshResult] = queue.SimpleQueue()
+        self.submissions_cache: list[dict] = []
+        self.scripts_cache: list[dict] = []
+        self.viewer_path: Path | None = None
+        self.viewer_lines: list[str] = []
+        self.viewer_error = ""
         self.home_items = [
             {"name": "run", "detail": "Run a script with sbatch interception"},
             {"name": "show", "detail": "Browse captured submissions"},
@@ -760,20 +789,34 @@ class InteractiveShell:
         self.screen = screen
         curses.curs_set(0)
         screen.keypad(True)
+        screen.timeout(100)
         while True:
-            self.draw()
+            self.tick()
+            if self.dirty:
+                self.draw()
+                self.dirty = False
             key = screen.getch()
+            if key == -1:
+                continue
             if key == 3:
                 return 0
             if self.handle_key(key):
                 return 0
+            self.dirty = True
+
+    def tick(self) -> None:
+        if self.drain_watch_results():
+            self.dirty = True
+        if self.view == "watch" and self.watch_refresh_due():
+            if self.schedule_watch_refresh():
+                self.dirty = True
 
     def filtered_home(self) -> list[dict]:
         return self.filter_items(self.home_items, lambda item: f"{item['name']} {item['detail']}")
 
     def filtered_submissions(self) -> list[dict]:
         return self.filter_items(
-            load_submissions(self.args.slurmctl_dir),
+            self.submissions_cache,
             lambda item: " ".join(
                 str(item.get(key) or "")
                 for key in (
@@ -787,9 +830,8 @@ class InteractiveShell:
         )
 
     def filtered_watch_jobs(self) -> list[dict]:
-        jobs, _source = self.get_watch_jobs()
         return self.filter_items(
-            jobs,
+            self.watch_cache,
             lambda item: " ".join(
                 str(item.get(key) or "")
                 for key in ("job_id", "job_name", "state", "elapsed", "nodes", "reason", "source")
@@ -797,12 +839,18 @@ class InteractiveShell:
         )
 
     def filtered_scripts(self) -> list[dict]:
+        return self.filter_items(self.scripts_cache, lambda item: item["path"])
+
+    def refresh_submissions_cache(self) -> None:
+        self.submissions_cache = load_submissions(self.args.slurmctl_dir)
+
+    def refresh_scripts_cache(self) -> None:
         scripts = []
         for path in sorted(Path.cwd().rglob("*.sh")):
             if ".slurmctl" in path.parts:
                 continue
             scripts.append({"path": str(path)})
-        return self.filter_items(scripts, lambda item: item["path"])
+        self.scripts_cache = scripts
 
     def filter_items(self, items: list[dict], text_fn) -> list[dict]:
         needle = self.query.lower().strip()
@@ -810,12 +858,71 @@ class InteractiveShell:
             return items
         return [item for item in items if needle in text_fn(item).lower()]
 
-    def get_watch_jobs(self, *, force: bool = False) -> tuple[list[dict], str]:
+    def watch_refresh_due(self) -> bool:
+        if self.watch_refreshing:
+            return False
+        if self.watch_loaded_at == 0.0:
+            return True
         now = time.monotonic()
-        if force or now - self.watch_loaded_at >= self.watch_ttl_seconds:
-            self.watch_cache, self.watch_source = load_watch_jobs(self.args.slurmctl_dir)
-            self.watch_loaded_at = now
-        return self.watch_cache, self.watch_source
+        return now - self.watch_loaded_at >= self.watch_refresh_interval_seconds
+
+    def schedule_watch_refresh(self, *, announce: bool = False) -> bool:
+        if self.watch_refreshing:
+            if announce:
+                self.message = "Watch refresh already in progress."
+            return False
+
+        self.watch_next_token += 1
+        token = self.watch_next_token
+        self.watch_active_token = token
+        self.watch_refreshing = True
+        self.watch_refresh_announce = announce
+        self.watch_error = ""
+        if announce:
+            self.message = "Refreshing watch..."
+
+        thread = threading.Thread(target=self.load_watch_jobs_in_background, args=(token,), daemon=True)
+        thread.start()
+        return True
+
+    def load_watch_jobs_in_background(self, token: int) -> None:
+        try:
+            jobs, source = load_watch_jobs(self.args.slurmctl_dir, timeout_seconds=self.watch_timeout_seconds)
+            error = ""
+            if source != "squeue --me" and not source.startswith("captured submissions"):
+                error = source
+            result = WatchRefreshResult(token, jobs, source, time.monotonic(), error)
+        except Exception as exc:  # Keep the UI alive even if an external tool fails strangely.
+            result = WatchRefreshResult(token, [], "watch refresh failed", time.monotonic(), str(exc))
+        self.watch_results.put(result)
+
+    def drain_watch_results(self) -> bool:
+        changed = False
+        while True:
+            try:
+                result = self.watch_results.get_nowait()
+            except queue.Empty:
+                break
+            if result.token != self.watch_active_token:
+                continue
+
+            self.watch_refreshing = False
+            self.watch_loaded_at = result.loaded_at
+            self.watch_error = result.error
+            if result.error:
+                if not self.watch_cache:
+                    self.watch_cache = result.jobs
+                    self.watch_source = result.source
+                if self.watch_refresh_announce:
+                    self.message = f"Watch refresh failed: {result.error}"
+            else:
+                self.watch_cache = result.jobs
+                self.watch_source = result.source
+                if self.watch_refresh_announce:
+                    self.message = f"Refreshed watch from {result.source}"
+            self.watch_refresh_announce = False
+            changed = True
+        return changed
 
     def clamp_selected(self, count: int) -> None:
         if count <= 0:
@@ -839,6 +946,14 @@ class InteractiveShell:
     def reset_selection(self) -> None:
         self.selected = 0
         self.scroll_top = 0
+
+    def prepare_view(self, view: str) -> None:
+        if view == "run":
+            self.refresh_scripts_cache()
+        elif view == "show":
+            self.refresh_submissions_cache()
+        elif view == "watch":
+            self.schedule_watch_refresh()
 
     def draw(self) -> None:
         assert self.screen is not None
@@ -894,10 +1009,13 @@ class InteractiveShell:
             "settings": "Settings",
         }.get(self.view, self.view.title())
         if self.view == "show":
-            context = f"{len(self.filtered_submissions())} shown / {len(load_submissions(self.args.slurmctl_dir))} total"
+            context = f"{len(self.filtered_submissions())} shown / {len(self.submissions_cache)} total"
         elif self.view == "watch":
-            jobs, source = self.get_watch_jobs()
-            context = f"{len(self.filtered_watch_jobs())} shown / {len(jobs)} total | {source}"
+            context = f"{len(self.filtered_watch_jobs())} shown / {len(self.watch_cache)} total | {self.watch_source}"
+            if self.watch_refreshing:
+                context += " | refreshing"
+            if self.watch_error:
+                context += f" | {self.watch_error}"
         elif self.view == "run":
             context = f"{len(self.filtered_scripts())} scripts"
         elif self.view == "actions":
@@ -1051,20 +1169,31 @@ class InteractiveShell:
             self.add(idx + 5, 2, f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4], attr)
 
     def draw_viewer(self, height: int, width: int) -> None:
-        path = Path(getattr(self, "viewer_path", ""))
-        self.add(2, 2, str(path)[: width - 4], curses.A_BOLD)
-        if not path.exists():
-            self.add(4, 2, "File does not exist."[: width - 4])
+        path = self.viewer_path
+        self.add(2, 2, str(path or "")[: width - 4], curses.A_BOLD)
+        if path is None:
+            self.add(4, 2, "No file selected."[: width - 4])
             return
-        try:
-            lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
-        except OSError as exc:
-            self.add(4, 2, str(exc)[: width - 4])
+        if self.viewer_error:
+            self.add(4, 2, self.viewer_error[: width - 4])
             return
+        lines = self.viewer_lines
         if self.query:
             lines = [line for line in lines if self.query.lower() in line.lower()]
         for idx, line in enumerate(lines[: max(0, height - 5)]):
             self.add(idx + 4, 0, line[: width - 1])
+
+    def load_viewer(self, path: Path) -> None:
+        self.viewer_path = path
+        self.viewer_lines = []
+        self.viewer_error = ""
+        if not path.exists():
+            self.viewer_error = "File does not exist."
+            return
+        try:
+            self.viewer_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+        except OSError as exc:
+            self.viewer_error = str(exc)
 
     def add(self, y: int, x: int, text: str, attr: int = curses.A_NORMAL) -> None:
         assert self.screen is not None
@@ -1103,8 +1232,7 @@ class InteractiveShell:
         if key == ord("q") and not self.search_active:
             return True
         if key in (ord("r"), ord("R")) and self.view == "watch":
-            self.get_watch_jobs(force=True)
-            self.message = f"Refreshed watch from {self.watch_source}"
+            self.schedule_watch_refresh(announce=True)
             return False
         if key in (ord("b"), ord("B")):
             self.go_back()
@@ -1130,7 +1258,7 @@ class InteractiveShell:
     def go_back(self) -> None:
         if self.view == "home":
             return
-        if self.view in {"run", "show"}:
+        if self.view in {"run", "show", "watch"}:
             self.view = "home"
         elif self.view == "actions":
             self.view = "show"
@@ -1163,6 +1291,7 @@ class InteractiveShell:
             if not items:
                 return
             self.view = items[self.selected]["name"]
+            self.prepare_view(self.view)
             self.query = ""
             self.search_active = False
             self.reset_selection()
@@ -1253,6 +1382,7 @@ class InteractiveShell:
             return
         if key == "D":
             delete_submission(record, self.args.slurmctl_dir)
+            self.refresh_submissions_cache()
             self.view = "show"
             self.query = ""
             self.search_active = False
@@ -1341,7 +1471,9 @@ class InteractiveShell:
         if not job_id:
             return None
         job_id_text = str(job_id)
-        for record in reversed(load_submissions(self.args.slurmctl_dir)):
+        if not self.submissions_cache:
+            self.refresh_submissions_cache()
+        for record in reversed(self.submissions_cache):
             if str(record.get("job_id") or "") == job_id_text:
                 return record
         return None
@@ -1373,6 +1505,7 @@ class InteractiveShell:
         finally:
             curses.reset_prog_mode()
             self.screen.keypad(True)
+            self.screen.timeout(100)
 
     def save_active_setting(self) -> None:
         key = self.editing_setting
@@ -1396,6 +1529,8 @@ class InteractiveShell:
         save_settings(self.settings)
         if key == "slurmctl_dir":
             self.args.slurmctl_dir = value
+            self.refresh_submissions_cache()
+            self.schedule_watch_refresh()
         self.editing_setting = None
         self.query = ""
         self.search_active = False
@@ -1422,6 +1557,8 @@ class InteractiveShell:
         self.settings["slurmctl_dir"] = value
         save_settings(self.settings)
         self.args.slurmctl_dir = value
+        self.refresh_submissions_cache()
+        self.schedule_watch_refresh()
         self.pending_slurmctl_dir = None
         self.query = ""
         self.search_active = False
@@ -1444,10 +1581,12 @@ class InteractiveShell:
             )
             code = run_script(namespace)
             input(f"\nslurmctl exited with {code}. Press Enter to return.")
+            self.refresh_submissions_cache()
             self.message = rerender_message
         finally:
             curses.reset_prog_mode()
             self.screen.keypad(True)
+            self.screen.timeout(100)
 
     def suspend_and_rerun(self, record: dict, return_view: str = "show") -> None:
         assert self.screen is not None
@@ -1462,6 +1601,9 @@ class InteractiveShell:
                 verbose=self.args.verbose,
             )
             input(f"\nrerun exited with {code}. Press Enter to return.")
+            self.refresh_submissions_cache()
+            if return_view == "watch":
+                self.schedule_watch_refresh()
             self.view = return_view
             self.query = ""
             self.search_active = False
@@ -1470,6 +1612,7 @@ class InteractiveShell:
         finally:
             curses.reset_prog_mode()
             self.screen.keypad(True)
+            self.screen.timeout(100)
 
 
 def doctor(args: argparse.Namespace) -> int:

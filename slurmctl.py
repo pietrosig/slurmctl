@@ -13,6 +13,8 @@ from __future__ import annotations
 
 import argparse
 import curses
+import datetime as dt
+import getpass
 import json
 import os
 import queue
@@ -382,6 +384,37 @@ DEFAULT_SETTINGS = {
     "slurmctl_dir": ".slurmctl",
 }
 
+RUNNING_STATES = {
+    "CONFIGURING",
+    "COMPLETING",
+    "RESIZING",
+    "RUNNING",
+    "SIGNALING",
+    "STAGE_OUT",
+    "STOPPED",
+    "SUSPENDED",
+}
+PENDING_STATES = {
+    "PENDING",
+    "REQUEUE_FED",
+    "REQUEUE_HOLD",
+    "REQUEUED",
+    "RESV_DEL_HOLD",
+    "REVOKED",
+    "SPECIAL_EXIT",
+}
+FINISHED_STATES = {
+    "BOOT_FAIL",
+    "CANCELLED",
+    "COMPLETED",
+    "DEADLINE",
+    "FAILED",
+    "NODE_FAIL",
+    "OUT_OF_MEMORY",
+    "PREEMPTED",
+    "TIMEOUT",
+}
+
 
 @dataclass(frozen=True)
 class WatchRefreshResult:
@@ -390,6 +423,9 @@ class WatchRefreshResult:
     source: str
     loaded_at: float
     error: str = ""
+    finished_jobs: list[dict] | None = None
+    finished_source: str = ""
+    finished_loaded_at: float = 0.0
 
 
 def config_path() -> Path:
@@ -668,7 +704,156 @@ def show(args: argparse.Namespace) -> int:
     return 0
 
 
-def load_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = None) -> tuple[list[dict], str]:
+def normalize_state(state: object) -> str:
+    parts = str(state or "").strip().upper().split()
+    return parts[0] if parts else ""
+
+
+def job_group(job: dict) -> str:
+    state = normalize_state(job.get("state"))
+    if state in RUNNING_STATES:
+        return "running"
+    if state in PENDING_STATES:
+        return "pending"
+    if state in FINISHED_STATES:
+        return "finished"
+    return "other"
+
+
+def parse_elapsed_seconds(elapsed: object) -> int:
+    text = str(elapsed or "").strip()
+    if not text or text in {"-", "Unknown"}:
+        return 0
+    days = 0
+    if "-" in text:
+        day_text, text = text.split("-", 1)
+        try:
+            days = int(day_text)
+        except ValueError:
+            days = 0
+    parts = text.split(":")
+    try:
+        values = [int(part) for part in parts]
+    except ValueError:
+        return 0
+    if len(values) == 3:
+        hours, minutes, seconds = values
+    elif len(values) == 2:
+        hours = 0
+        minutes, seconds = values
+    elif len(values) == 1:
+        hours = 0
+        minutes = values[0]
+        seconds = 0
+    else:
+        return 0
+    return days * 86400 + hours * 3600 + minutes * 60 + seconds
+
+
+def watch_sort_key(job: dict) -> tuple[int, int, str, str]:
+    order = {"running": 0, "pending": 1, "finished": 2, "other": 3}
+    group = job_group(job)
+    elapsed = parse_elapsed_seconds(job.get("elapsed"))
+    elapsed_key = elapsed if group == "running" else 0
+    return (
+        order[group],
+        elapsed_key,
+        str(job.get("job_name") or ""),
+        str(job.get("job_id") or ""),
+    )
+
+
+def sort_watch_jobs(jobs: list[dict]) -> list[dict]:
+    return sorted(jobs, key=watch_sort_key)
+
+
+def watch_stats(jobs: list[dict]) -> dict[str, int]:
+    stats = {"running": 0, "pending": 0, "finished": 0}
+    for job in jobs:
+        group = job_group(job)
+        if group in stats:
+            stats[group] += 1
+    return stats
+
+
+def parse_slurm_datetime(value: object) -> dt.datetime | None:
+    text = str(value or "").strip()
+    if not text or text in {"Unknown", "N/A"}:
+        return None
+    for fmt in ("%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"):
+        try:
+            return dt.datetime.strptime(text, fmt)
+        except ValueError:
+            pass
+    return None
+
+
+def load_recent_finished_jobs(timeout_seconds: float | None = None, *, hours: int = 12) -> tuple[list[dict], str]:
+    sacct = shutil.which("sacct")
+    if not sacct:
+        return [], "sacct not found"
+
+    cutoff = dt.datetime.now() - dt.timedelta(hours=hours)
+    starttime = cutoff.strftime("%Y-%m-%dT%H:%M:%S")
+    command = [
+        sacct,
+        "-X",
+        "--noheader",
+        "--parsable2",
+        "--user",
+        getpass.getuser(),
+        f"--starttime={starttime}",
+        "--format=JobIDRaw,JobName,State,Elapsed,NNodes,End",
+    ]
+    try:
+        proc = subprocess.run(command, text=True, capture_output=True, timeout=timeout_seconds)
+    except subprocess.TimeoutExpired:
+        timeout_text = f"{timeout_seconds:g}s" if timeout_seconds is not None else "unknown timeout"
+        return [], f"sacct timed out after {timeout_text}"
+    if proc.returncode != 0:
+        return [], proc.stderr.strip() or "sacct failed"
+
+    jobs = []
+    for line in proc.stdout.splitlines():
+        parts = line.split("|", 5)
+        if len(parts) != 6:
+            continue
+        job_id, name, state, elapsed, nodes, ended_at = [part.strip() for part in parts]
+        if normalize_state(state) not in FINISHED_STATES:
+            continue
+        parsed_end = parse_slurm_datetime(ended_at)
+        if parsed_end is None or parsed_end < cutoff:
+            continue
+        jobs.append(
+            {
+                "source": "sacct",
+                "job_id": job_id,
+                "job_name": name,
+                "state": state,
+                "elapsed": elapsed,
+                "nodes": nodes or "-",
+                "reason": f"ended {ended_at}",
+            }
+        )
+    return jobs, f"sacct last {hours}h"
+
+
+def combine_watch_jobs(
+    live_jobs: list[dict],
+    live_source: str,
+    finished_jobs: list[dict],
+    finished_source: str,
+) -> tuple[list[dict], str]:
+    jobs = [*live_jobs, *finished_jobs]
+    source = live_source
+    if finished_jobs:
+        source += f" + {finished_source}"
+    elif finished_source and finished_source != "sacct not found":
+        source += f" + {finished_source}"
+    return sort_watch_jobs(jobs), source
+
+
+def load_live_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = None) -> tuple[list[dict], str]:
     squeue = shutil.which("squeue")
     if squeue:
         command = [squeue, "--me", "--noheader", "--format=%i|%j|%T|%M|%D|%R"]
@@ -715,6 +900,12 @@ def load_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = None) 
     return fallback, "captured submissions; squeue not found"
 
 
+def load_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = None) -> tuple[list[dict], str]:
+    live_jobs, live_source = load_live_watch_jobs(slurmctl_dir, timeout_seconds=timeout_seconds)
+    finished_jobs, finished_source = load_recent_finished_jobs(timeout_seconds, hours=12)
+    return combine_watch_jobs(live_jobs, live_source, finished_jobs, finished_source)
+
+
 def cancel_job(job_id: str, *, dry_run: bool) -> tuple[int, str]:
     if dry_run:
         return 0, f"dry-run: would cancel job {job_id}"
@@ -728,7 +919,13 @@ def cancel_job(job_id: str, *, dry_run: bool) -> tuple[int, str]:
 
 def watch(args: argparse.Namespace) -> int:
     jobs, source = load_watch_jobs(args.slurmctl_dir)
+    stats = watch_stats(jobs)
     print(f"source: {source}")
+    print(
+        f"stats: running {stats['running']} | "
+        f"pending {stats['pending']} | "
+        f"finished last 12h {stats['finished']}"
+    )
     print("JOB_ID   STATE        ELAPSED    NODES  NAME                 REASON")
     for job in jobs:
         print(
@@ -761,12 +958,16 @@ class InteractiveShell:
         self.watch_error = ""
         self.watch_loaded_at = 0.0
         self.watch_refresh_interval_seconds = 2.0
+        self.watch_finished_refresh_interval_seconds = 60.0
         self.watch_timeout_seconds = 3.0
         self.watch_refreshing = False
         self.watch_refresh_announce = False
         self.watch_next_token = 0
         self.watch_active_token = 0
         self.watch_results: queue.SimpleQueue[WatchRefreshResult] = queue.SimpleQueue()
+        self.watch_finished_cache: list[dict] = []
+        self.watch_finished_source = "sacct not loaded"
+        self.watch_finished_loaded_at = 0.0
         self.submissions_cache: list[dict] = []
         self.scripts_cache: list[dict] = []
         self.viewer_path: Path | None = None
@@ -866,6 +1067,12 @@ class InteractiveShell:
         now = time.monotonic()
         return now - self.watch_loaded_at >= self.watch_refresh_interval_seconds
 
+    def watch_finished_refresh_due(self) -> bool:
+        if self.watch_finished_loaded_at == 0.0:
+            return True
+        now = time.monotonic()
+        return now - self.watch_finished_loaded_at >= self.watch_finished_refresh_interval_seconds
+
     def schedule_watch_refresh(self, *, announce: bool = False) -> bool:
         if self.watch_refreshing:
             if announce:
@@ -874,6 +1081,7 @@ class InteractiveShell:
 
         self.watch_next_token += 1
         token = self.watch_next_token
+        refresh_finished = announce or self.watch_finished_refresh_due()
         self.watch_active_token = token
         self.watch_refreshing = True
         self.watch_refresh_announce = announce
@@ -881,17 +1089,50 @@ class InteractiveShell:
         if announce:
             self.message = "Refreshing watch..."
 
-        thread = threading.Thread(target=self.load_watch_jobs_in_background, args=(token,), daemon=True)
+        thread = threading.Thread(
+            target=self.load_watch_jobs_in_background,
+            args=(
+                token,
+                refresh_finished,
+                list(self.watch_finished_cache),
+                self.watch_finished_source,
+                self.watch_finished_loaded_at,
+            ),
+            daemon=True,
+        )
         thread.start()
         return True
 
-    def load_watch_jobs_in_background(self, token: int) -> None:
+    def load_watch_jobs_in_background(
+        self,
+        token: int,
+        refresh_finished: bool,
+        cached_finished: list[dict],
+        cached_finished_source: str,
+        cached_finished_loaded_at: float,
+    ) -> None:
         try:
-            jobs, source = load_watch_jobs(self.args.slurmctl_dir, timeout_seconds=self.watch_timeout_seconds)
+            finished_jobs = cached_finished
+            finished_source = cached_finished_source
+            finished_loaded_at = cached_finished_loaded_at
+            if refresh_finished:
+                finished_jobs, finished_source = load_recent_finished_jobs(self.watch_timeout_seconds, hours=12)
+                finished_loaded_at = time.monotonic()
+            live_jobs, live_source = load_live_watch_jobs(self.args.slurmctl_dir, timeout_seconds=self.watch_timeout_seconds)
+            jobs, source = combine_watch_jobs(live_jobs, live_source, finished_jobs, finished_source)
             error = ""
-            if source != "squeue --me" and not source.startswith("captured submissions"):
+            if not source.startswith("squeue --me") and not source.startswith("captured submissions"):
                 error = source
-            result = WatchRefreshResult(token, jobs, source, time.monotonic(), error)
+            result = WatchRefreshResult(
+                token,
+                jobs,
+                source,
+                time.monotonic(),
+                error,
+                finished_jobs if refresh_finished else None,
+                finished_source if refresh_finished else "",
+                finished_loaded_at if refresh_finished else 0.0,
+            )
         except Exception as exc:  # Keep the UI alive even if an external tool fails strangely.
             result = WatchRefreshResult(token, [], "watch refresh failed", time.monotonic(), str(exc))
         self.watch_results.put(result)
@@ -909,6 +1150,10 @@ class InteractiveShell:
             self.watch_refreshing = False
             self.watch_loaded_at = result.loaded_at
             self.watch_error = result.error
+            if result.finished_jobs is not None:
+                self.watch_finished_cache = result.finished_jobs
+                self.watch_finished_source = result.finished_source
+                self.watch_finished_loaded_at = result.finished_loaded_at
             if result.error:
                 if not self.watch_cache:
                     self.watch_cache = result.jobs
@@ -1072,9 +1317,16 @@ class InteractiveShell:
     def draw_watch(self, height: int, width: int) -> None:
         items = self.filtered_watch_jobs()
         self.clamp_selected(len(items))
+        stats = watch_stats(self.watch_cache)
+        stats_line = (
+            f"running {stats['running']} | "
+            f"pending {stats['pending']} | "
+            f"finished last 12h {stats['finished']}"
+        )
+        self.add(2, 0, stats_line[: width - 1], curses.A_BOLD)
         header = f"{'JOB_ID':<8} {'STATE':<12} {'ELAPSED':<10} {'NODES':<6} {'NAME':<22} REASON"
-        self.add(2, 0, header[: width - 1], curses.A_BOLD)
-        start, visible = self.visible_slice(items, height - 4)
+        self.add(3, 0, header[: width - 1], curses.A_BOLD)
+        start, visible = self.visible_slice(items, height - 5)
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
@@ -1086,7 +1338,7 @@ class InteractiveShell:
                 f"{item.get('job_name') or '-':<22} "
                 f"{item.get('reason') or '-'}"
             )
-            self.add(idx + 3, 0, row[: width - 1], attr)
+            self.add(idx + 4, 0, row[: width - 1], attr)
 
     def action_items(self) -> list[dict]:
         actions = [
@@ -1622,6 +1874,7 @@ def doctor(args: argparse.Namespace) -> int:
     print(f"python: {sys.executable}")
     print(f"sbatch: {real_sbatch or 'not found'}")
     print(f"squeue: {shutil.which('squeue') or 'not found'}")
+    print(f"sacct: {shutil.which('sacct') or 'not found'}")
     print(f"scancel: {shutil.which('scancel') or 'not found'}")
     print(f"settings: {config_path()}")
     print(f"editor: {settings.get('editor') or '(VISUAL/EDITOR/editor/nano/vi)'}")

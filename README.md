@@ -13,6 +13,7 @@ It works by putting a temporary fake `sbatch` at the front of `PATH`. The fake
 - Python 3.11+
 - Standard library only
 - Slurm tools for real submissions: `sbatch`, `squeue`, `scancel`
+- Optional Slurm accounting for recently finished jobs: `sacct`
 
 `--dry-run` works without Slurm installed.
 
@@ -114,8 +115,9 @@ and stderr path.
 slurmctl watch
 ```
 
-Uses `squeue --me` when available. If `squeue` is not installed, it falls back
-to captured submissions so the view still works off-cluster.
+Uses `squeue --me` when available. If `sacct` is available, watch also includes
+jobs that finished in the last 12 hours. If `squeue` is not installed, it falls
+back to captured submissions so the view still works off-cluster.
 
 ### `doctor`
 
@@ -162,8 +164,8 @@ In `watch`, selecting a job opens similar actions plus:
 
 - `C`: cancel a live Slurm job
 
-The interactive `watch` view caches `squeue` results briefly so large job lists
-do not make every redraw slow. Press `R` in the watch list to refresh manually.
+The interactive `watch` view caches Slurm results briefly so large job lists do
+not make every redraw slow. Press `R` in the watch list to refresh manually.
 
 Cancel is guarded: you must type `CANCEL` and press Enter before `scancel` is
 called. With `--dry-run`, cancel only reports what would happen.

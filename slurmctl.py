@@ -1188,6 +1188,9 @@ class InteractiveShell:
         self.scroll_top = max(0, min(self.scroll_top, max_top))
         return self.scroll_top, items[self.scroll_top : self.scroll_top + max_rows]
 
+    def content_rows(self, height: int, first_row: int) -> int:
+        return max(0, height - first_row - 2)
+
     def reset_selection(self) -> None:
         self.selected = 0
         self.scroll_top = 0
@@ -1280,7 +1283,7 @@ class InteractiveShell:
     def draw_home(self, height: int, width: int) -> None:
         items = self.filtered_home()
         self.clamp_selected(len(items))
-        start, visible = self.visible_slice(items, height - 3)
+        start, visible = self.visible_slice(items, self.content_rows(height, 2))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
@@ -1290,7 +1293,7 @@ class InteractiveShell:
         items = self.filtered_scripts()
         self.clamp_selected(len(items))
         self.add(2, 2, "Enter runs the selected script, or the typed path if there is no match."[: width - 4])
-        start, visible = self.visible_slice(items, height - 5)
+        start, visible = self.visible_slice(items, self.content_rows(height, 4))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
@@ -1301,7 +1304,7 @@ class InteractiveShell:
         self.clamp_selected(len(items))
         header = f"{'JOB_ID':<8} {'HASH':<16} {'SCRIPT':<22} {'OUT':<24} ERR"
         self.add(2, 0, header[: width - 1], curses.A_BOLD)
-        start, visible = self.visible_slice(items, height - 4)
+        start, visible = self.visible_slice(items, self.content_rows(height, 3))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
@@ -1326,9 +1329,20 @@ class InteractiveShell:
         self.add(2, 0, stats_line[: width - 1], curses.A_BOLD)
         header = f"{'JOB_ID':<8} {'STATE':<12} {'ELAPSED':<10} {'NODES':<6} {'NAME':<22} REASON"
         self.add(3, 0, header[: width - 1], curses.A_BOLD)
-        start, visible = self.visible_slice(items, height - 5)
+        max_rows = self.content_rows(height, 4)
+        start, visible = self.visible_slice(items, max(0, max_rows - 3))
+        row_y = 4
+        previous_group = job_group(items[start - 1]) if start > 0 and start <= len(items) else None
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
+            current_group = job_group(item)
+            if previous_group and current_group != previous_group and row_y <= height - 3:
+                label = f" {current_group.upper()} "
+                divider = label.center(max(0, width - 1), "-")
+                self.add(row_y, 0, divider[: width - 1], curses.A_DIM)
+                row_y += 1
+            if row_y > height - 3:
+                break
             attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             row = (
                 f"{item.get('job_id') or '-':<8} "
@@ -1338,7 +1352,9 @@ class InteractiveShell:
                 f"{item.get('job_name') or '-':<22} "
                 f"{item.get('reason') or '-'}"
             )
-            self.add(idx + 4, 0, row[: width - 1], attr)
+            self.add(row_y, 0, row[: width - 1], attr)
+            row_y += 1
+            previous_group = current_group
 
     def action_items(self) -> list[dict]:
         actions = [
@@ -1385,7 +1401,7 @@ class InteractiveShell:
         items = self.settings_items()
         self.clamp_selected(len(items))
         self.add(2, 2, "Enter edits the selected setting. Empty editor means environment/default fallback."[: width - 4])
-        start, visible = self.visible_slice(items, height - 5)
+        start, visible = self.visible_slice(items, self.content_rows(height, 4))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
@@ -1397,7 +1413,7 @@ class InteractiveShell:
         self.add(2, 2, f"Selected: {record.get('job_id') or '-'} {record.get('script_path') or '-'}"[: width - 4])
         items = self.action_items()
         self.clamp_selected(len(items))
-        start, visible = self.visible_slice(items, height - 5)
+        start, visible = self.visible_slice(items, self.content_rows(height, 4))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
@@ -1414,7 +1430,7 @@ class InteractiveShell:
             self.add(3, 2, "Type CANCEL in the bottom bar and press Enter to cancel this job."[: width - 4], curses.A_BOLD)
         items = self.watch_action_items()
         self.clamp_selected(len(items))
-        start, visible = self.visible_slice(items, height - 6)
+        start, visible = self.visible_slice(items, self.content_rows(height, 5))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
@@ -1432,7 +1448,7 @@ class InteractiveShell:
         lines = self.viewer_lines
         if self.query:
             lines = [line for line in lines if self.query.lower() in line.lower()]
-        for idx, line in enumerate(lines[: max(0, height - 5)]):
+        for idx, line in enumerate(lines[: self.content_rows(height, 4)]):
             self.add(idx + 4, 0, line[: width - 1])
 
     def load_viewer(self, path: Path) -> None:

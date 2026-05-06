@@ -907,12 +907,21 @@ def load_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = None) 
 
 
 def cancel_job(job_id: str, *, dry_run: bool) -> tuple[int, str]:
+    return cancel_jobs([job_id], dry_run=dry_run)
+
+
+def cancel_jobs(job_ids: list[str], *, dry_run: bool) -> tuple[int, str]:
+    job_ids = [job_id for job_id in job_ids if job_id]
+    if not job_ids:
+        return 2, "no job ids to cancel"
     if dry_run:
-        return 0, f"dry-run: would cancel job {job_id}"
+        if len(job_ids) == 1:
+            return 0, f"dry-run: would cancel job {job_ids[0]}"
+        return 0, f"dry-run: would cancel jobs {', '.join(job_ids)}"
     scancel = shutil.which("scancel")
     if not scancel:
         return 127, "scancel not found"
-    proc = subprocess.run([scancel, job_id], text=True, capture_output=True)
+    proc = subprocess.run([scancel, *job_ids], text=True, capture_output=True)
     output = (proc.stdout + proc.stderr).strip()
     return proc.returncode, output or f"scancel exited with {proc.returncode}"
 
@@ -950,6 +959,8 @@ class InteractiveShell:
         self.view = "home"
         self.query = ""
         self.search_active = False
+        self.watch_visual_anchor: int | None = None
+        self.pending_cancel_jobs: list[dict] = []
         self.reset_selection()
         self.message = ""
         self.dirty = True
@@ -1008,7 +1019,12 @@ class InteractiveShell:
     def tick(self) -> None:
         if self.drain_watch_results():
             self.dirty = True
-        if self.view == "watch" and self.watch_refresh_due():
+        if (
+            self.view == "watch"
+            and not self.watch_visual_active()
+            and not self.confirm_cancel
+            and self.watch_refresh_due()
+        ):
             if self.schedule_watch_refresh():
                 self.dirty = True
 
@@ -1058,6 +1074,42 @@ class InteractiveShell:
         if not needle:
             return items
         return [item for item in items if needle in text_fn(item).lower()]
+
+    def watch_visual_active(self) -> bool:
+        return self.view == "watch" and self.watch_visual_anchor is not None
+
+    def watch_visual_bounds(self, count: int) -> tuple[int, int] | None:
+        if self.watch_visual_anchor is None or count <= 0:
+            return None
+        anchor = max(0, min(self.watch_visual_anchor, count - 1))
+        selected = max(0, min(self.selected, count - 1))
+        return (min(anchor, selected), max(anchor, selected))
+
+    def selected_watch_jobs(self) -> list[dict]:
+        items = self.filtered_watch_jobs()
+        if not items:
+            return []
+        bounds = self.watch_visual_bounds(len(items))
+        if bounds is None:
+            return [items[max(0, min(self.selected, len(items) - 1))]]
+        start, end = bounds
+        return items[start : end + 1]
+
+    def toggle_watch_visual(self) -> None:
+        items = self.filtered_watch_jobs()
+        if not items:
+            self.message = "No watch jobs to select."
+            return
+        if self.watch_visual_active():
+            self.watch_visual_anchor = None
+            self.message = "Visual selection cleared."
+            return
+        self.clamp_selected(len(items))
+        self.watch_visual_anchor = self.selected
+        self.message = ""
+
+    def clear_watch_visual(self) -> None:
+        self.watch_visual_anchor = None
 
     def watch_refresh_due(self) -> bool:
         if self.watch_refreshing:
@@ -1194,6 +1246,7 @@ class InteractiveShell:
     def reset_selection(self) -> None:
         self.selected = 0
         self.scroll_top = 0
+        self.clear_watch_visual()
 
     def prepare_view(self, view: str) -> None:
         if view == "run":
@@ -1227,7 +1280,7 @@ class InteractiveShell:
             self.draw_settings(height, width)
 
         if height > 2:
-            status = self.message or "Enter select | arrows move | Tab search on/off | B back | q quit"
+            status = self.status_line()
             self.add(height - 2, 0, status[: width - 1])
         prompt = {
             "home": "Search commands",
@@ -1242,6 +1295,16 @@ class InteractiveShell:
         marker = "*" if self.search_active else " "
         self.add(height - 1, 0, f"{marker} {prompt}: {self.query}"[: width - 1], curses.A_REVERSE)
         self.screen.refresh()
+
+    def status_line(self) -> str:
+        if self.confirm_cancel:
+            return self.message or "Type CANCEL and press Enter to confirm."
+        if self.watch_visual_active():
+            if self.message:
+                return self.message
+            count = len(self.selected_watch_jobs())
+            return f"Visual: {count} selected | up/down extend | C cancel | v clear | B back"
+        return self.message or "Enter select | arrows move | Tab search on/off | B back | q quit"
 
     def draw_header(self, height: int, width: int) -> None:
         if height < 2:
@@ -1320,6 +1383,7 @@ class InteractiveShell:
     def draw_watch(self, height: int, width: int) -> None:
         items = self.filtered_watch_jobs()
         self.clamp_selected(len(items))
+        bounds = self.watch_visual_bounds(len(items))
         stats = watch_stats(self.watch_cache)
         stats_line = (
             f"running {stats['running']} | "
@@ -1343,7 +1407,10 @@ class InteractiveShell:
                 row_y += 1
             if row_y > height - 3:
                 break
-            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            in_visual_range = bounds is not None and bounds[0] <= absolute_idx <= bounds[1]
+            attr = curses.A_REVERSE if absolute_idx == self.selected or in_visual_range else curses.A_NORMAL
+            if absolute_idx == self.selected:
+                attr |= curses.A_BOLD
             row = (
                 f"{item.get('job_id') or '-':<8} "
                 f"{item.get('state') or '-':<12} "
@@ -1497,6 +1564,16 @@ class InteractiveShell:
                 self.query += chr(key)
                 self.reset_selection()
             return False
+        if key == 27 and self.watch_visual_active():
+            self.clear_watch_visual()
+            self.message = "Visual selection cleared."
+            return False
+        if key in (ord("v"), ord("V")) and self.view == "watch":
+            self.toggle_watch_visual()
+            return False
+        if key in (ord("c"), ord("C")) and self.view == "watch" and self.watch_visual_active():
+            self.begin_cancel_jobs(self.selected_watch_jobs())
+            return False
         if key == ord("q") and not self.search_active:
             return True
         if key in (ord("r"), ord("R")) and self.view == "watch":
@@ -1545,14 +1622,14 @@ class InteractiveShell:
         self.message = ""
 
     def activate(self) -> None:
+        if self.confirm_cancel:
+            self.confirm_cancel_action()
+            return
         if self.view == "settings" and self.editing_setting:
             self.save_active_setting()
             return
         if self.view == "settings" and self.pending_slurmctl_dir is not None:
             self.finish_slurmctl_dir_change()
-            return
-        if self.view == "watch_actions" and self.confirm_cancel:
-            self.confirm_cancel_action()
             return
         if self.view == "home":
             items = self.filtered_home()
@@ -1579,6 +1656,9 @@ class InteractiveShell:
             self.reset_selection()
             return
         if self.view == "watch":
+            if self.watch_visual_active():
+                self.message = "Press C to cancel the visual selection, or v to clear it."
+                return
             items = self.filtered_watch_jobs()
             if not items:
                 return
@@ -1684,15 +1764,7 @@ class InteractiveShell:
             return
         submission = job.get("submission") or self.find_submission_for_job(job.get("job_id"))
         if key == "C":
-            job_id = str(job.get("job_id") or "")
-            if not job_id or job.get("source") != "squeue":
-                self.message = "Cancel is only available for live squeue jobs."
-                self.query = ""
-                return
-            self.confirm_cancel = True
-            self.query = ""
-            self.search_active = True
-            self.message = f"Confirm cancel for job {job_id}: type CANCEL and press Enter."
+            self.begin_cancel_jobs([job])
             return
         if key == "R":
             if submission:
@@ -1718,22 +1790,52 @@ class InteractiveShell:
             else:
                 self.message = "No captured metadata for this job."
 
+    def begin_cancel_jobs(self, jobs: list[dict]) -> None:
+        if not jobs:
+            self.message = "No jobs selected."
+            self.query = ""
+            return
+        cancelable = [
+            job
+            for job in jobs
+            if job.get("source") == "squeue" and str(job.get("job_id") or "")
+        ]
+        if len(cancelable) != len(jobs):
+            self.message = "Cancel is only available for live squeue jobs."
+            self.query = ""
+            return
+        self.pending_cancel_jobs = cancelable
+        self.confirm_cancel = True
+        self.query = ""
+        self.search_active = True
+        job_ids = [str(job.get("job_id") or "") for job in cancelable]
+        if len(job_ids) == 1:
+            self.message = f"Confirm cancel for job {job_ids[0]}: type CANCEL and press Enter."
+        else:
+            preview = ", ".join(job_ids[:3])
+            suffix = "" if len(job_ids) <= 3 else f", +{len(job_ids) - 3} more"
+            self.message = f"Confirm cancel for {len(job_ids)} jobs ({preview}{suffix}): type CANCEL and press Enter."
+
     def confirm_cancel_action(self) -> None:
-        job = getattr(self, "active_job", None) or {}
-        job_id = str(job.get("job_id") or "")
+        jobs = self.pending_cancel_jobs
+        job_ids = [str(job.get("job_id") or "") for job in jobs if str(job.get("job_id") or "")]
         if self.query.strip() != "CANCEL":
             self.message = "Cancel aborted; confirmation text did not match CANCEL."
             self.confirm_cancel = False
+            self.pending_cancel_jobs = []
             self.query = ""
             self.search_active = False
             return
-        code, output = cancel_job(job_id, dry_run=self.args.dry_run)
-        self.message = f"Cancel exited {code}: {output}"
+        code, output = cancel_jobs(job_ids, dry_run=self.args.dry_run)
+        target = f"{len(job_ids)} jobs" if len(job_ids) != 1 else f"job {job_ids[0] or '-'}"
+        self.message = f"Cancel {target} exited {code}: {output}"
         self.confirm_cancel = False
+        self.pending_cancel_jobs = []
         self.query = ""
         self.search_active = False
         self.view = "watch"
         self.reset_selection()
+        self.schedule_watch_refresh()
 
     def find_submission_for_job(self, job_id: object) -> dict | None:
         if not job_id:

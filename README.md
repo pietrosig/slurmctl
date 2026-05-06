@@ -163,6 +163,9 @@ In `show`, selecting a submission opens actions:
 In `watch`, selecting a job opens similar actions plus:
 
 - `C`: cancel a live Slurm job
+- `v`: start or clear visual selection
+- Arrow up/down or `j`/`k`: extend visual selection
+- `C` while visually selecting: cancel all selected live Slurm jobs
 
 The interactive `watch` view caches Slurm results briefly so large job lists do
 not make every redraw slow. Press `R` in the watch list to refresh manually.

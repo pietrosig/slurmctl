@@ -750,16 +750,32 @@ def parse_elapsed_seconds(elapsed: object) -> int:
     return days * 86400 + hours * 3600 + minutes * 60 + seconds
 
 
+def parse_job_id_number(job_id: object) -> int:
+    text = str(job_id or "")
+    digits = []
+    for char in text:
+        if char.isdigit():
+            digits.append(char)
+        elif digits:
+            break
+    if not digits:
+        return -1
+    return int("".join(digits))
+
+
 def watch_sort_key(job: dict) -> tuple[int, int, str, str]:
     order = {"running": 0, "pending": 1, "finished": 2, "other": 3}
     group = job_group(job)
+    job_id = str(job.get("job_id") or "")
+    if group == "finished":
+        return (order[group], -parse_job_id_number(job_id), "", job_id)
     elapsed = parse_elapsed_seconds(job.get("elapsed"))
     elapsed_key = elapsed if group == "running" else 0
     return (
         order[group],
         elapsed_key,
         str(job.get("job_name") or ""),
-        str(job.get("job_id") or ""),
+        job_id,
     )
 
 

@@ -229,14 +229,33 @@ def normalize_options(script_directives: dict, cli_options: dict) -> dict:
     return normalized
 
 
-def resolve_template(template: str | None, job_id: str | None, job_name: str | None) -> str | None:
+def infer_job_name(job_name: str | None, script_path: str | None) -> str | None:
+    if job_name:
+        return str(job_name)
+    if script_path:
+        return Path(script_path).name
+    return None
+
+
+def resolve_template(
+    template: str | None,
+    job_id: str | None,
+    job_name: str | None,
+    script_path: str | None = None,
+) -> str | None:
     if template is None:
         return None
     result = str(template)
+    job_name = infer_job_name(job_name, script_path)
     if job_id:
         result = result.replace("%j", job_id)
+        result = result.replace("%J", job_id)
+        result = result.replace("%A", job_id.split("_", 1)[0])
+        if "_" in job_id:
+            result = result.replace("%a", job_id.split("_", 1)[1])
     if job_name:
         result = result.replace("%x", job_name)
+    result = result.replace("%%", "%")
     return result
 
 
@@ -319,8 +338,8 @@ def main() -> int:
     stdout_template = normalized.get("output")
     stderr_template = normalized.get("error")
     job_name = normalized.get("job_name")
-    resolved_stdout = resolve_template(stdout_template, job_id, job_name)
-    resolved_stderr = resolve_template(stderr_template, job_id, job_name)
+    resolved_stdout = resolve_template(stdout_template, job_id, job_name, script_path)
+    resolved_stderr = resolve_template(stderr_template, job_id, job_name, script_path)
 
     run_record = {
         "run_id": run_id,
@@ -427,6 +446,37 @@ class WatchRefreshResult:
     finished_jobs: list[dict] | None = None
     finished_source: str = ""
     finished_loaded_at: float = 0.0
+
+
+def infer_output_job_name(job_name: object, script_path: object) -> str | None:
+    if job_name:
+        return str(job_name)
+    if script_path:
+        return Path(str(script_path)).name
+    return None
+
+
+def resolve_output_template(
+    template: object,
+    job_id: object,
+    job_name: object,
+    script_path: object,
+) -> str | None:
+    if template is None:
+        return None
+    result = str(template)
+    job_id_text = str(job_id or "")
+    inferred_job_name = infer_output_job_name(job_name, script_path)
+    if job_id_text:
+        result = result.replace("%j", job_id_text)
+        result = result.replace("%J", job_id_text)
+        result = result.replace("%A", job_id_text.split("_", 1)[0])
+        if "_" in job_id_text:
+            result = result.replace("%a", job_id_text.split("_", 1)[1])
+    if inferred_job_name:
+        result = result.replace("%x", inferred_job_name)
+    result = result.replace("%%", "%")
+    return result
 
 
 def config_path() -> Path:
@@ -1906,13 +1956,38 @@ class InteractiveShell:
         return None
 
     def open_record_path_in_editor(self, record: dict, key: str) -> None:
-        value = record.get(key)
+        value = self.resolve_record_path_value(record, key)
         if not value:
             self.message = "No path recorded."
             return
         base = Path(record.get("submit_cwd") or ".")
         path = Path(value)
         self.suspend_and_edit(path if path.is_absolute() else base / path)
+
+    def resolve_record_path_value(self, record: dict, key: str) -> str | None:
+        value = record.get(key)
+        template_key = {
+            "resolved_stdout_path": "stdout_template",
+            "resolved_stderr_path": "stderr_template",
+        }.get(key)
+        if template_key and (not value or "%" in str(value)):
+            template = record.get(template_key) or value
+            options = record.get("normalized_options", {})
+            value = resolve_output_template(
+                template,
+                record.get("job_id"),
+                options.get("job_name"),
+                record.get("script_path"),
+            )
+        elif value and "%" in str(value):
+            options = record.get("normalized_options", {})
+            value = resolve_output_template(
+                value,
+                record.get("job_id"),
+                options.get("job_name"),
+                record.get("script_path"),
+            )
+        return str(value) if value else None
 
     def suspend_and_edit(self, path: Path) -> None:
         assert self.screen is not None

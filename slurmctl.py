@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import curses
 import datetime as dt
+import errno
 import getpass
 import json
 import os
@@ -549,7 +550,12 @@ def run_script(args: argparse.Namespace) -> int:
         command = [str(script_abs), *args.script_args]
         if not os.access(script_abs, os.X_OK):
             command = ["/bin/sh", str(script_abs), *args.script_args]
-        proc = subprocess.run(command, env=env)
+        try:
+            proc = subprocess.run(command, env=env)
+        except OSError as exc:
+            if exc.errno != errno.ENOEXEC or command[0] == "/bin/sh":
+                raise
+            proc = subprocess.run(["/bin/sh", str(script_abs), *args.script_args], env=env)
         return proc.returncode
 
 

@@ -100,6 +100,22 @@ slurmctl run SCRIPT [SCRIPT_ARGS...] [--dry-run]
 
 Runs `SCRIPT` while intercepting every `sbatch` command it invokes.
 
+### `sbatch`
+
+```bash
+slurmctl sbatch [SBATCH_OPTIONS...] SCRIPT [SCRIPT_ARGS...]
+```
+
+Submits one `sbatch` recipe directly while capturing the same metadata as
+intercepted submissions.
+
+Examples:
+
+```bash
+slurmctl --dry-run sbatch examples/basic/job1.sh
+slurmctl sbatch --output logs/%j.out --job-name test examples/basic/job2.sh
+```
+
 ### `show`
 
 ```bash

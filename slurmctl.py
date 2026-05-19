@@ -468,6 +468,25 @@ def extract_tool_options(argv: list[str]) -> tuple[argparse.Namespace, list[str]
     return known, remaining
 
 
+def find_sbatch_command(argv: list[str]) -> int | None:
+    i = 0
+    while i < len(argv):
+        arg = argv[i]
+        if arg in {"--dry-run", "--verbose"}:
+            i += 1
+            continue
+        if arg == "--slurmctl-dir":
+            i += 2
+            continue
+        if arg.startswith("--slurmctl-dir="):
+            i += 1
+            continue
+        if arg in {"-h", "--help"}:
+            return None
+        return i if arg == "sbatch" else None
+    return None
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="slurmctl.py",
@@ -481,6 +500,9 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="run a script with sbatch interception")
     run_parser.add_argument("script")
     run_parser.add_argument("script_args", nargs=argparse.REMAINDER)
+
+    sbatch_parser = subparsers.add_parser("sbatch", help="submit one sbatch recipe and capture it")
+    sbatch_parser.add_argument("sbatch_args", nargs=argparse.REMAINDER)
 
     subparsers.add_parser("show", help="show captured submissions")
     subparsers.add_parser("watch", help="show current Slurm jobs")
@@ -594,6 +616,19 @@ def run_sbatch_args(
         cwd = submit_cwd if submit_cwd and Path(submit_cwd).exists() else None
         proc = subprocess.run([str(wrapper), *raw_args], cwd=cwd, env=env)
         return proc.returncode
+
+
+def sbatch(args: argparse.Namespace) -> int:
+    if not args.sbatch_args:
+        print("slurmctl: usage: slurmctl sbatch [SBATCH_OPTIONS...] SCRIPT [SCRIPT_ARGS...]", file=sys.stderr)
+        return 2
+    return run_sbatch_args(
+        list(args.sbatch_args),
+        submit_cwd=str(Path.cwd()),
+        slurmctl_dir=args.slurmctl_dir,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+    )
 
 
 def load_submissions(slurmctl_dir: str) -> list[dict]:
@@ -2030,6 +2065,24 @@ def main(argv: list[str] | None = None) -> int:
 
     # Allow slurmctl options after `run SCRIPT`, e.g.:
     #   python slurmctl.py run examples/basic/runner.sh --dry-run
+    sbatch_index = find_sbatch_command(argv)
+    if sbatch_index is not None:
+        tool_opts, normalized_prefix = extract_tool_options(argv[:sbatch_index])
+        if tool_opts.help:
+            parser.print_help()
+            return 0
+        if normalized_prefix:
+            parser.parse_args([*normalized_prefix, "sbatch"])
+        settings = load_settings()
+        args = argparse.Namespace(
+            command="sbatch",
+            sbatch_args=argv[sbatch_index + 1 :],
+            dry_run=tool_opts.dry_run,
+            verbose=tool_opts.verbose,
+            slurmctl_dir=tool_opts.slurmctl_dir or settings["slurmctl_dir"],
+        )
+        return sbatch(args)
+
     tool_opts, normalized_argv = extract_tool_options(argv)
     if tool_opts.help:
         parser.print_help()
@@ -2042,6 +2095,8 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "run":
         return run_script(args)
+    if args.command == "sbatch":
+        return sbatch(args)
     if args.command == "show":
         return show(args)
     if args.command == "watch":

@@ -2,7 +2,7 @@
 """:'
 for py in "${SLURMCTL_PYTHON:-}" python3.13 python3.12 python3.11 python3; do
     [ -n "$py" ] || continue
-    "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || continue
+    "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11)" >/dev/null 2>&1 || continue
     exec "$py" "$0" "$@"
 done
 echo "slurmctl: Python 3.11+ is required" >&2

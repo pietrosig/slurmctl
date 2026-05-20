@@ -1,5 +1,5 @@
 #!/bin/sh
-''':'
+""":'
 for py in "${SLURMCTL_PYTHON:-}" python3.13 python3.12 python3.11 python3; do
     [ -n "$py" ] || continue
     "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || continue
@@ -7,7 +7,7 @@ for py in "${SLURMCTL_PYTHON:-}" python3.13 python3.12 python3.11 python3; do
 done
 echo "slurmctl: Python 3.11+ is required" >&2
 exit 127
-':'''
+':"""
 
 from __future__ import annotations
 
@@ -31,7 +31,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-WRAPPER_CODE = r'''from __future__ import annotations
+WRAPPER_CODE = r"""from __future__ import annotations
 
 import datetime as _dt
 import fcntl
@@ -396,7 +396,7 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-'''
+"""
 
 
 DEFAULT_SETTINGS = {
@@ -493,10 +493,12 @@ def load_settings() -> dict:
         return settings
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         return settings
     if isinstance(loaded, dict):
-        settings.update({key: str(value) for key, value in loaded.items() if key in settings})
+        settings.update(
+            {key: str(value) for key, value in loaded.items() if key in settings}
+        )
     return settings
 
 
@@ -542,22 +544,32 @@ def build_parser() -> argparse.ArgumentParser:
         prog="slurmctl.py",
         description="Minimal sbatch interception helper.",
     )
-    parser.add_argument("--dry-run", action="store_true", help="simulate sbatch submissions")
-    parser.add_argument("--verbose", action="store_true", help="print intercepted calls and paths")
+    parser.add_argument(
+        "--dry-run", action="store_true", help="simulate sbatch submissions"
+    )
+    parser.add_argument(
+        "--verbose", action="store_true", help="print intercepted calls and paths"
+    )
     parser.add_argument("--slurmctl-dir", help="metadata directory")
     subparsers = parser.add_subparsers(dest="command")
 
-    run_parser = subparsers.add_parser("run", help="run a script with sbatch interception")
+    run_parser = subparsers.add_parser(
+        "run", help="run a script with sbatch interception"
+    )
     run_parser.add_argument("script")
     run_parser.add_argument("script_args", nargs=argparse.REMAINDER)
 
-    sbatch_parser = subparsers.add_parser("sbatch", help="submit one sbatch recipe and capture it")
+    sbatch_parser = subparsers.add_parser(
+        "sbatch", help="submit one sbatch recipe and capture it"
+    )
     sbatch_parser.add_argument("sbatch_args", nargs=argparse.REMAINDER)
 
     subparsers.add_parser("show", help="show captured submissions")
     subparsers.add_parser("watch", help="show current Slurm jobs")
     subparsers.add_parser("doctor", help="check sbatch discovery")
-    subparsers.add_parser("interactive", aliases=["shell", "ui"], help="open interactive shell")
+    subparsers.add_parser(
+        "interactive", aliases=["shell", "ui"], help="open interactive shell"
+    )
     return parser
 
 
@@ -568,7 +580,8 @@ def discover_real_sbatch() -> str | None:
 def make_wrapper(wrapper_dir: Path) -> Path:
     wrapper = wrapper_dir / "sbatch"
     python = sys.executable or shutil.which("python3") or "python3"
-    launcher = """#!/bin/sh
+    launcher = (
+        """#!/bin/sh
 ''':'
 py="${SLURMCTL_PYTHON:-%s}"
 "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || {
@@ -577,7 +590,9 @@ py="${SLURMCTL_PYTHON:-%s}"
 }
 exec "$py" "$0" "$@"
 ':'''
-""" % python
+"""
+        % python
+    )
     wrapper.write_text(f"{launcher}{WRAPPER_CODE}", encoding="utf-8")
     mode = wrapper.stat().st_mode
     wrapper.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
@@ -593,11 +608,18 @@ def run_script(args: argparse.Namespace) -> int:
 
     real_sbatch = discover_real_sbatch()
     if not real_sbatch and not args.dry_run:
-        print("slurmctl: sbatch not found on PATH; rerun with --dry-run to simulate submissions", file=sys.stderr)
+        print(
+            "slurmctl: sbatch not found on PATH; rerun with --dry-run to simulate submissions",
+            file=sys.stderr,
+        )
         return 127
 
     slurmctl_dir = Path(args.slurmctl_dir)
-    slurmctl_dir_abs = slurmctl_dir if slurmctl_dir.is_absolute() else (Path.cwd() / slurmctl_dir).resolve()
+    slurmctl_dir_abs = (
+        slurmctl_dir
+        if slurmctl_dir.is_absolute()
+        else (Path.cwd() / slurmctl_dir).resolve()
+    )
     slurmctl_dir_abs.mkdir(parents=True, exist_ok=True)
     (slurmctl_dir_abs / "commands").mkdir(exist_ok=True)
     (slurmctl_dir_abs / "runs").mkdir(exist_ok=True)
@@ -615,7 +637,10 @@ def run_script(args: argparse.Namespace) -> int:
             env["SLURMCTL_REAL_SBATCH"] = real_sbatch
 
         if args.verbose:
-            print(f"slurmctl: real sbatch: {real_sbatch or '(not found)'}", file=sys.stderr)
+            print(
+                f"slurmctl: real sbatch: {real_sbatch or '(not found)'}",
+                file=sys.stderr,
+            )
             print(f"slurmctl: wrapper dir: {wrapper_dir}", file=sys.stderr)
             print(f"slurmctl: metadata dir: {slurmctl_dir_abs}", file=sys.stderr)
 
@@ -627,7 +652,9 @@ def run_script(args: argparse.Namespace) -> int:
         except OSError as exc:
             if exc.errno != errno.ENOEXEC or command[0] == "/bin/sh":
                 raise
-            proc = subprocess.run(["/bin/sh", str(script_abs), *args.script_args], env=env)
+            proc = subprocess.run(
+                ["/bin/sh", str(script_abs), *args.script_args], env=env
+            )
         return proc.returncode
 
 
@@ -642,7 +669,10 @@ def run_sbatch_args(
     """Run one sbatch recipe through the same fake wrapper used by run."""
     real_sbatch = discover_real_sbatch()
     if not real_sbatch and not dry_run:
-        print("slurmctl: sbatch not found on PATH; rerun with --dry-run to simulate submissions", file=sys.stderr)
+        print(
+            "slurmctl: sbatch not found on PATH; rerun with --dry-run to simulate submissions",
+            file=sys.stderr,
+        )
         return 127
 
     slurmctl_dir_abs = Path(slurmctl_dir)
@@ -670,7 +700,10 @@ def run_sbatch_args(
 
 def sbatch(args: argparse.Namespace) -> int:
     if not args.sbatch_args:
-        print("slurmctl: usage: slurmctl sbatch [SBATCH_OPTIONS...] SCRIPT [SCRIPT_ARGS...]", file=sys.stderr)
+        print(
+            "slurmctl: usage: slurmctl sbatch [SBATCH_OPTIONS...] SCRIPT [SCRIPT_ARGS...]",
+            file=sys.stderr,
+        )
         return 2
     return run_sbatch_args(
         list(args.sbatch_args),
@@ -708,7 +741,11 @@ def rewrite_submissions(slurmctl_dir: str, records: list[dict]) -> None:
 
 
 def delete_submission(record: dict, slurmctl_dir: str) -> None:
-    records = [item for item in load_submissions(slurmctl_dir) if item.get("run_id") != record.get("run_id")]
+    records = [
+        item
+        for item in load_submissions(slurmctl_dir)
+        if item.get("run_id") != record.get("run_id")
+    ]
     rewrite_submissions(slurmctl_dir, records)
     run_id = record.get("run_id")
     if run_id:
@@ -729,7 +766,9 @@ def delete_submission(record: dict, slurmctl_dir: str) -> None:
     except json.JSONDecodeError:
         return
     command["runs"] = [item for item in command.get("runs", []) if item != run_id]
-    command_path.write_text(json.dumps(command, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    command_path.write_text(
+        json.dumps(command, indent=2, sort_keys=True) + "\n", encoding="utf-8"
+    )
 
 
 def editor_command(configured: str | None = None) -> list[str]:
@@ -779,7 +818,9 @@ def show(args: argparse.Namespace) -> int:
         print(f"No submissions found in {slurmctl_dir}")
         return 0
 
-    print("JOB_ID   COMMAND_HASH      SCRIPT_PATH          STDOUT                 STDERR")
+    print(
+        "JOB_ID   COMMAND_HASH      SCRIPT_PATH          STDOUT                 STDERR"
+    )
     with submissions.open("r", encoding="utf-8") as handle:
         for line in handle:
             if not line.strip():
@@ -895,7 +936,9 @@ def parse_slurm_datetime(value: object) -> dt.datetime | None:
     return None
 
 
-def load_recent_finished_jobs(timeout_seconds: float | None = None, *, hours: int = 12) -> tuple[list[dict], str]:
+def load_recent_finished_jobs(
+    timeout_seconds: float | None = None, *, hours: int = 24
+) -> tuple[list[dict], str]:
     sacct = shutil.which("sacct")
     if not sacct:
         return [], "sacct not found"
@@ -913,9 +956,15 @@ def load_recent_finished_jobs(timeout_seconds: float | None = None, *, hours: in
         "--format=JobIDRaw,JobName,State,Elapsed,NNodes,End",
     ]
     try:
-        proc = subprocess.run(command, text=True, capture_output=True, timeout=timeout_seconds)
+        proc = subprocess.run(
+            command, text=True, capture_output=True, timeout=timeout_seconds
+        )
     except subprocess.TimeoutExpired:
-        timeout_text = f"{timeout_seconds:g}s" if timeout_seconds is not None else "unknown timeout"
+        timeout_text = (
+            f"{timeout_seconds:g}s"
+            if timeout_seconds is not None
+            else "unknown timeout"
+        )
         return [], f"sacct timed out after {timeout_text}"
     if proc.returncode != 0:
         return [], proc.stderr.strip() or "sacct failed"
@@ -960,14 +1009,22 @@ def combine_watch_jobs(
     return sort_watch_jobs(jobs), source
 
 
-def load_live_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = None) -> tuple[list[dict], str]:
+def load_live_watch_jobs(
+    slurmctl_dir: str, *, timeout_seconds: float | None = None
+) -> tuple[list[dict], str]:
     squeue = shutil.which("squeue")
     if squeue:
         command = [squeue, "--me", "--noheader", "--format=%i|%j|%T|%M|%D|%R"]
         try:
-            proc = subprocess.run(command, text=True, capture_output=True, timeout=timeout_seconds)
+            proc = subprocess.run(
+                command, text=True, capture_output=True, timeout=timeout_seconds
+            )
         except subprocess.TimeoutExpired:
-            timeout_text = f"{timeout_seconds:g}s" if timeout_seconds is not None else "unknown timeout"
+            timeout_text = (
+                f"{timeout_seconds:g}s"
+                if timeout_seconds is not None
+                else "unknown timeout"
+            )
             return [], f"squeue timed out after {timeout_text}"
         if proc.returncode == 0:
             jobs = []
@@ -975,7 +1032,9 @@ def load_live_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = N
                 parts = line.split("|", 5)
                 if len(parts) != 6:
                     continue
-                job_id, name, state, elapsed, nodes, reason = [part.strip() for part in parts]
+                job_id, name, state, elapsed, nodes, reason = [
+                    part.strip() for part in parts
+                ]
                 jobs.append(
                     {
                         "source": "squeue",
@@ -996,7 +1055,8 @@ def load_live_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = N
             {
                 "source": "captured",
                 "job_id": record.get("job_id"),
-                "job_name": record.get("normalized_options", {}).get("job_name") or record.get("script_path"),
+                "job_name": record.get("normalized_options", {}).get("job_name")
+                or record.get("script_path"),
                 "state": "captured",
                 "elapsed": "-",
                 "nodes": "-",
@@ -1007,9 +1067,15 @@ def load_live_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = N
     return fallback, "captured submissions; squeue not found"
 
 
-def load_watch_jobs(slurmctl_dir: str, *, timeout_seconds: float | None = None) -> tuple[list[dict], str]:
-    live_jobs, live_source = load_live_watch_jobs(slurmctl_dir, timeout_seconds=timeout_seconds)
-    finished_jobs, finished_source = load_recent_finished_jobs(timeout_seconds, hours=12)
+def load_watch_jobs(
+    slurmctl_dir: str, *, timeout_seconds: float | None = None
+) -> tuple[list[dict], str]:
+    live_jobs, live_source = load_live_watch_jobs(
+        slurmctl_dir, timeout_seconds=timeout_seconds
+    )
+    finished_jobs, finished_source = load_recent_finished_jobs(
+        timeout_seconds, hours=24
+    )
     return combine_watch_jobs(live_jobs, live_source, finished_jobs, finished_source)
 
 
@@ -1136,7 +1202,9 @@ class InteractiveShell:
                 self.dirty = True
 
     def filtered_home(self) -> list[dict]:
-        return self.filter_items(self.home_items, lambda item: f"{item['name']} {item['detail']}")
+        return self.filter_items(
+            self.home_items, lambda item: f"{item['name']} {item['detail']}"
+        )
 
     def filtered_submissions(self) -> list[dict]:
         return self.filter_items(
@@ -1158,7 +1226,15 @@ class InteractiveShell:
             self.watch_cache,
             lambda item: " ".join(
                 str(item.get(key) or "")
-                for key in ("job_id", "job_name", "state", "elapsed", "nodes", "reason", "source")
+                for key in (
+                    "job_id",
+                    "job_name",
+                    "state",
+                    "elapsed",
+                    "nodes",
+                    "reason",
+                    "source",
+                )
             ),
         )
 
@@ -1230,7 +1306,10 @@ class InteractiveShell:
         if self.watch_finished_loaded_at == 0.0:
             return True
         now = time.monotonic()
-        return now - self.watch_finished_loaded_at >= self.watch_finished_refresh_interval_seconds
+        return (
+            now - self.watch_finished_loaded_at
+            >= self.watch_finished_refresh_interval_seconds
+        )
 
     def schedule_watch_refresh(self, *, announce: bool = False) -> bool:
         if self.watch_refreshing:
@@ -1275,12 +1354,20 @@ class InteractiveShell:
             finished_source = cached_finished_source
             finished_loaded_at = cached_finished_loaded_at
             if refresh_finished:
-                finished_jobs, finished_source = load_recent_finished_jobs(self.watch_timeout_seconds, hours=12)
+                finished_jobs, finished_source = load_recent_finished_jobs(
+                    self.watch_timeout_seconds, hours=24
+                )
                 finished_loaded_at = time.monotonic()
-            live_jobs, live_source = load_live_watch_jobs(self.args.slurmctl_dir, timeout_seconds=self.watch_timeout_seconds)
-            jobs, source = combine_watch_jobs(live_jobs, live_source, finished_jobs, finished_source)
+            live_jobs, live_source = load_live_watch_jobs(
+                self.args.slurmctl_dir, timeout_seconds=self.watch_timeout_seconds
+            )
+            jobs, source = combine_watch_jobs(
+                live_jobs, live_source, finished_jobs, finished_source
+            )
             error = ""
-            if not source.startswith("squeue --me") and not source.startswith("captured submissions"):
+            if not source.startswith("squeue --me") and not source.startswith(
+                "captured submissions"
+            ):
                 error = source
             result = WatchRefreshResult(
                 token,
@@ -1292,8 +1379,12 @@ class InteractiveShell:
                 finished_source if refresh_finished else "",
                 finished_loaded_at if refresh_finished else 0.0,
             )
-        except Exception as exc:  # Keep the UI alive even if an external tool fails strangely.
-            result = WatchRefreshResult(token, [], "watch refresh failed", time.monotonic(), str(exc))
+        except (
+            Exception
+        ) as exc:  # Keep the UI alive even if an external tool fails strangely.
+            result = WatchRefreshResult(
+                token, [], "watch refresh failed", time.monotonic(), str(exc)
+            )
         self.watch_results.put(result)
 
     def drain_watch_results(self) -> bool:
@@ -1400,7 +1491,12 @@ class InteractiveShell:
             "settings": "Search/edit settings",
         }.get(self.view, "Search")
         marker = "*" if self.search_active else " "
-        self.add(height - 1, 0, f"{marker} {prompt}: {self.query}"[: width - 1], curses.A_REVERSE)
+        self.add(
+            height - 1,
+            0,
+            f"{marker} {prompt}: {self.query}"[: width - 1],
+            curses.A_REVERSE,
+        )
         self.screen.refresh()
 
     def status_line(self) -> str:
@@ -1411,7 +1507,10 @@ class InteractiveShell:
                 return self.message
             count = len(self.selected_watch_jobs())
             return f"Visual: {count} selected | up/down extend | C cancel | v clear | B back"
-        return self.message or "Enter select | arrows move | Tab search on/off | B back | q quit"
+        return (
+            self.message
+            or "Enter select | arrows move | Tab search on/off | B back | q quit"
+        )
 
     def draw_header(self, height: int, width: int) -> None:
         if height < 2:
@@ -1456,17 +1555,29 @@ class InteractiveShell:
         start, visible = self.visible_slice(items, self.content_rows(height, 2))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
-            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
-            self.add(idx + 2, 2, f"{item['name']:<8} {item['detail']}"[: width - 4], attr)
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
+            self.add(
+                idx + 2, 2, f"{item['name']:<8} {item['detail']}"[: width - 4], attr
+            )
 
     def draw_run(self, height: int, width: int) -> None:
         items = self.filtered_scripts()
         self.clamp_selected(len(items))
-        self.add(2, 2, "Enter runs the selected script, or the typed path if there is no match."[: width - 4])
+        self.add(
+            2,
+            2,
+            "Enter runs the selected script, or the typed path if there is no match."[
+                : width - 4
+            ],
+        )
         start, visible = self.visible_slice(items, self.content_rows(height, 4))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
-            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
             self.add(idx + 4, 2, item["path"][: width - 4], attr)
 
     def draw_show(self, height: int, width: int) -> None:
@@ -1477,7 +1588,9 @@ class InteractiveShell:
         start, visible = self.visible_slice(items, self.content_rows(height, 3))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
-            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
             row = (
                 f"{item.get('job_id') or '-':<8} "
                 f"{item.get('command_hash') or '-':<16} "
@@ -1503,19 +1616,31 @@ class InteractiveShell:
         max_rows = self.content_rows(height, 4)
         start, visible = self.visible_slice(items, max(0, max_rows - 3))
         row_y = 4
-        previous_group = job_group(items[start - 1]) if start > 0 and start <= len(items) else None
+        previous_group = (
+            job_group(items[start - 1]) if start > 0 and start <= len(items) else None
+        )
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             current_group = job_group(item)
-            if previous_group and current_group != previous_group and row_y <= height - 3:
+            if (
+                previous_group
+                and current_group != previous_group
+                and row_y <= height - 3
+            ):
                 label = f" {current_group.upper()} "
                 divider = label.center(max(0, width - 1), "-")
                 self.add(row_y, 0, divider[: width - 1], curses.A_DIM)
                 row_y += 1
             if row_y > height - 3:
                 break
-            in_visual_range = bounds is not None and bounds[0] <= absolute_idx <= bounds[1]
-            attr = curses.A_REVERSE if absolute_idx == self.selected or in_visual_range else curses.A_NORMAL
+            in_visual_range = (
+                bounds is not None and bounds[0] <= absolute_idx <= bounds[1]
+            )
+            attr = (
+                curses.A_REVERSE
+                if absolute_idx == self.selected or in_visual_range
+                else curses.A_NORMAL
+            )
             if absolute_idx == self.selected:
                 attr |= curses.A_BOLD
             row = (
@@ -1533,31 +1658,72 @@ class InteractiveShell:
     def action_items(self) -> list[dict]:
         actions = [
             {"key": "D", "name": "delete", "detail": "Delete this captured run"},
-            {"key": "R", "name": "rerun", "detail": "Submit the same sbatch recipe again"},
-            {"key": "OO", "name": "open output file", "detail": "View resolved stdout file"},
-            {"key": "OE", "name": "open error file", "detail": "View resolved stderr file"},
-            {"key": "JSON", "name": "open run json", "detail": "View captured metadata"},
+            {
+                "key": "R",
+                "name": "rerun",
+                "detail": "Submit the same sbatch recipe again",
+            },
+            {
+                "key": "OO",
+                "name": "open output file",
+                "detail": "View resolved stdout file",
+            },
+            {
+                "key": "OE",
+                "name": "open error file",
+                "detail": "View resolved stderr file",
+            },
+            {
+                "key": "JSON",
+                "name": "open run json",
+                "detail": "View captured metadata",
+            },
             {"key": "B", "name": "back", "detail": "Return to show"},
         ]
-        return self.filter_items(actions, lambda item: f"{item['key']} {item['name']} {item['detail']}")
+        return self.filter_items(
+            actions, lambda item: f"{item['key']} {item['name']} {item['detail']}"
+        )
 
     def watch_action_items(self) -> list[dict]:
         actions = [
-            {"key": "C", "name": "cancel job", "detail": "Prompt, then run scancel for this job"},
-            {"key": "R", "name": "rerun", "detail": "Rerun captured sbatch recipe when available"},
-            {"key": "OO", "name": "open output file", "detail": "Open captured stdout file when available"},
-            {"key": "OE", "name": "open error file", "detail": "Open captured stderr file when available"},
-            {"key": "JSON", "name": "open run json", "detail": "Open captured metadata when available"},
+            {
+                "key": "C",
+                "name": "cancel job",
+                "detail": "Prompt, then run scancel for this job",
+            },
+            {
+                "key": "R",
+                "name": "rerun",
+                "detail": "Rerun captured sbatch recipe when available",
+            },
+            {
+                "key": "OO",
+                "name": "open output file",
+                "detail": "Open captured stdout file when available",
+            },
+            {
+                "key": "OE",
+                "name": "open error file",
+                "detail": "Open captured stderr file when available",
+            },
+            {
+                "key": "JSON",
+                "name": "open run json",
+                "detail": "Open captured metadata when available",
+            },
             {"key": "B", "name": "back", "detail": "Return to watch"},
         ]
-        return self.filter_items(actions, lambda item: f"{item['key']} {item['name']} {item['detail']}")
+        return self.filter_items(
+            actions, lambda item: f"{item['key']} {item['name']} {item['detail']}"
+        )
 
     def settings_items(self) -> list[dict]:
         items = [
             {
                 "key": "editor",
                 "name": "default editor",
-                "value": self.settings.get("editor") or "(VISUAL/EDITOR/editor/nano/vi)",
+                "value": self.settings.get("editor")
+                or "(VISUAL/EDITOR/editor/nano/vi)",
                 "detail": "Command used for OO, OE, and JSON",
             },
             {
@@ -1569,46 +1735,85 @@ class InteractiveShell:
         ]
         if self.editing_setting:
             return items
-        return self.filter_items(items, lambda item: f"{item['name']} {item['value']} {item['detail']}")
+        return self.filter_items(
+            items, lambda item: f"{item['name']} {item['value']} {item['detail']}"
+        )
 
     def draw_settings(self, height: int, width: int) -> None:
         items = self.settings_items()
         self.clamp_selected(len(items))
-        self.add(2, 2, "Enter edits the selected setting. Empty editor means environment/default fallback."[: width - 4])
+        self.add(
+            2,
+            2,
+            "Enter edits the selected setting. Empty editor means environment/default fallback."[
+                : width - 4
+            ],
+        )
         start, visible = self.visible_slice(items, self.content_rows(height, 4))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
-            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
             row = f"{item['name']:<18} {item['value']:<32} {item['detail']}"
             self.add(idx + 4, 2, row[: width - 4], attr)
 
     def draw_actions(self, height: int, width: int) -> None:
         record = getattr(self, "active_record", None) or {}
-        self.add(2, 2, f"Selected: {record.get('job_id') or '-'} {record.get('script_path') or '-'}"[: width - 4])
+        self.add(
+            2,
+            2,
+            f"Selected: {record.get('job_id') or '-'} {record.get('script_path') or '-'}"[
+                : width - 4
+            ],
+        )
         items = self.action_items()
         self.clamp_selected(len(items))
         start, visible = self.visible_slice(items, self.content_rows(height, 4))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
-            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
-            self.add(idx + 4, 2, f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4], attr)
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
+            self.add(
+                idx + 4,
+                2,
+                f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4],
+                attr,
+            )
 
     def draw_watch_actions(self, height: int, width: int) -> None:
         job = getattr(self, "active_job", None) or {}
         self.add(
             2,
             2,
-            f"Selected: {job.get('job_id') or '-'} {job.get('state') or '-'} {job.get('job_name') or '-'}"[: width - 4],
+            f"Selected: {job.get('job_id') or '-'} {job.get('state') or '-'} {job.get('job_name') or '-'}"[
+                : width - 4
+            ],
         )
         if self.confirm_cancel:
-            self.add(3, 2, "Type CANCEL in the bottom bar and press Enter to cancel this job."[: width - 4], curses.A_BOLD)
+            self.add(
+                3,
+                2,
+                "Type CANCEL in the bottom bar and press Enter to cancel this job."[
+                    : width - 4
+                ],
+                curses.A_BOLD,
+            )
         items = self.watch_action_items()
         self.clamp_selected(len(items))
         start, visible = self.visible_slice(items, self.content_rows(height, 5))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
-            attr = curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
-            self.add(idx + 5, 2, f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4], attr)
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
+            self.add(
+                idx + 5,
+                2,
+                f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4],
+                attr,
+            )
 
     def draw_viewer(self, height: int, width: int) -> None:
         path = self.viewer_path
@@ -1633,7 +1838,9 @@ class InteractiveShell:
             self.viewer_error = "File does not exist."
             return
         try:
-            self.viewer_lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+            self.viewer_lines = path.read_text(
+                encoding="utf-8", errors="replace"
+            ).splitlines()
         except OSError as exc:
             self.viewer_error = str(exc)
 
@@ -1678,7 +1885,11 @@ class InteractiveShell:
         if key in (ord("v"), ord("V")) and self.view == "watch":
             self.toggle_watch_visual()
             return False
-        if key in (ord("c"), ord("C")) and self.view == "watch" and self.watch_visual_active():
+        if (
+            key in (ord("c"), ord("C"))
+            and self.view == "watch"
+            and self.watch_visual_active()
+        ):
             self.begin_cancel_jobs(self.selected_watch_jobs())
             return False
         if key == ord("q") and not self.search_active:
@@ -1764,7 +1975,9 @@ class InteractiveShell:
             return
         if self.view == "watch":
             if self.watch_visual_active():
-                self.message = "Press C to cancel the visual selection, or v to clear it."
+                self.message = (
+                    "Press C to cancel the visual selection, or v to clear it."
+                )
                 return
             items = self.filtered_watch_jobs()
             if not items:
@@ -1809,7 +2022,9 @@ class InteractiveShell:
         if not script:
             self.message = "No script selected."
             return
-        self.suspend_and_run(["run", script], rerender_message=f"Finished running {script}")
+        self.suspend_and_run(
+            ["run", script], rerender_message=f"Finished running {script}"
+        )
 
     def maybe_activate_shortcut(self, char: str) -> None:
         self.query += char
@@ -1856,7 +2071,9 @@ class InteractiveShell:
         if key == "JSON":
             run_id = record.get("run_id")
             if run_id:
-                self.suspend_and_edit(Path(self.args.slurmctl_dir) / "runs" / f"{run_id}.json")
+                self.suspend_and_edit(
+                    Path(self.args.slurmctl_dir) / "runs" / f"{run_id}.json"
+                )
 
     def perform_watch_action(self, key: str) -> None:
         job = getattr(self, "active_job", None)
@@ -1869,7 +2086,9 @@ class InteractiveShell:
             self.reset_selection()
             self.confirm_cancel = False
             return
-        submission = job.get("submission") or self.find_submission_for_job(job.get("job_id"))
+        submission = job.get("submission") or self.find_submission_for_job(
+            job.get("job_id")
+        )
         if key == "C":
             self.begin_cancel_jobs([job])
             return
@@ -1893,7 +2112,11 @@ class InteractiveShell:
             return
         if key == "JSON":
             if submission and submission.get("run_id"):
-                self.suspend_and_edit(Path(self.args.slurmctl_dir) / "runs" / f"{submission['run_id']}.json")
+                self.suspend_and_edit(
+                    Path(self.args.slurmctl_dir)
+                    / "runs"
+                    / f"{submission['run_id']}.json"
+                )
             else:
                 self.message = "No captured metadata for this job."
 
@@ -1917,7 +2140,9 @@ class InteractiveShell:
         self.search_active = True
         job_ids = [str(job.get("job_id") or "") for job in cancelable]
         if len(job_ids) == 1:
-            self.message = f"Confirm cancel for job {job_ids[0]}: type CANCEL and press Enter."
+            self.message = (
+                f"Confirm cancel for job {job_ids[0]}: type CANCEL and press Enter."
+            )
         else:
             preview = ", ".join(job_ids[:3])
             suffix = "" if len(job_ids) <= 3 else f", +{len(job_ids) - 3} more"
@@ -1925,7 +2150,9 @@ class InteractiveShell:
 
     def confirm_cancel_action(self) -> None:
         jobs = self.pending_cancel_jobs
-        job_ids = [str(job.get("job_id") or "") for job in jobs if str(job.get("job_id") or "")]
+        job_ids = [
+            str(job.get("job_id") or "") for job in jobs if str(job.get("job_id") or "")
+        ]
         if self.query.strip() != "CANCEL":
             self.message = "Cancel aborted; confirmation text did not match CANCEL."
             self.confirm_cancel = False
@@ -1934,7 +2161,9 @@ class InteractiveShell:
             self.search_active = False
             return
         code, output = cancel_jobs(job_ids, dry_run=self.args.dry_run)
-        target = f"{len(job_ids)} jobs" if len(job_ids) != 1 else f"job {job_ids[0] or '-'}"
+        target = (
+            f"{len(job_ids)} jobs" if len(job_ids) != 1 else f"job {job_ids[0] or '-'}"
+        )
         self.message = f"Cancel {target} exited {code}: {output}"
         self.confirm_cancel = False
         self.pending_cancel_jobs = []
@@ -2045,7 +2274,9 @@ class InteractiveShell:
             return
         answer = self.query.strip().upper()
         if answer not in {"MOVE", "SKIP"}:
-            self.message = "Type MOVE to move current data, or SKIP to only change the setting."
+            self.message = (
+                "Type MOVE to move current data, or SKIP to only change the setting."
+            )
             return
         old_dir = resolve_from_cwd(self.args.slurmctl_dir)
         new_dir = resolve_from_cwd(value)
@@ -2068,7 +2299,9 @@ class InteractiveShell:
         moved = "moved data and " if answer == "MOVE" else ""
         self.message = f"{moved}saved slurmctl_dir in {config_path()}"
 
-    def suspend_and_run(self, command_argv: list[str], *, rerender_message: str) -> None:
+    def suspend_and_run(
+        self, command_argv: list[str], *, rerender_message: str
+    ) -> None:
         assert self.screen is not None
         curses.def_prog_mode()
         curses.endwin()
@@ -2166,7 +2399,11 @@ def main(argv: list[str] | None = None) -> int:
     settings = load_settings()
     args.dry_run = bool(getattr(args, "dry_run", False) or tool_opts.dry_run)
     args.verbose = bool(getattr(args, "verbose", False) or tool_opts.verbose)
-    args.slurmctl_dir = tool_opts.slurmctl_dir or getattr(args, "slurmctl_dir", None) or settings["slurmctl_dir"]
+    args.slurmctl_dir = (
+        tool_opts.slurmctl_dir
+        or getattr(args, "slurmctl_dir", None)
+        or settings["slurmctl_dir"]
+    )
 
     if args.command == "run":
         return run_script(args)

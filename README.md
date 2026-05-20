@@ -132,7 +132,7 @@ slurmctl watch
 ```
 
 Uses `squeue --me` when available. If `sacct` is available, watch also includes
-jobs that finished in the last 12 hours. If `squeue` is not installed, it falls
+jobs that finished in the last 24 hours. If `squeue` is not installed, it falls
 back to captured submissions so the view still works off-cluster.
 
 ### `doctor`

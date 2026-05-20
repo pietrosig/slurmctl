@@ -1,0 +1,32 @@
+{
+  "command_hash": "aa6220d0b81347cc",
+  "first_seen_at": "2026-05-04T14:25:13.102953+00:00",
+  "normalized_options": {
+    "error": "logs/job2-%j.err",
+    "job_name": "test_job2",
+    "output": "logs/job2-%j.out"
+  },
+  "parsed_cli_options": {
+    "error": "logs/job2-%j.err",
+    "job_name": "test_job2",
+    "output": "logs/job2-%j.out"
+  },
+  "parsed_script_directives": {},
+  "raw_args": [
+    "--output",
+    "logs/job2-%j.out",
+    "--error",
+    "logs/job2-%j.err",
+    "--job-name",
+    "test_job2",
+    "job2.sh"
+  ],
+  "runs": [
+    "1b5f35150fb6b040",
+    "f661b9ab108fda34",
+    "717248dade5a050c"
+  ],
+  "script_abs_path": "/home/pietrosig/slurmctl/examples/basic/job2.sh",
+  "script_path": "job2.sh",
+  "submit_cwd": "/home/pietrosig/slurmctl/examples/basic"
+}

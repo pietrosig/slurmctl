@@ -1,0 +1,30 @@
+{
+  "command_hash": "aa6220d0b81347cc",
+  "job_id": "999999",
+  "normalized_options": {
+    "error": "logs/job2-%j.err",
+    "job_name": "test_job2",
+    "output": "logs/job2-%j.out"
+  },
+  "raw_args": [
+    "--output",
+    "logs/job2-%j.out",
+    "--error",
+    "logs/job2-%j.err",
+    "--job-name",
+    "test_job2",
+    "job2.sh"
+  ],
+  "resolved_stderr_path": "logs/job2-999999.err",
+  "resolved_stdout_path": "logs/job2-999999.out",
+  "run_id": "f661b9ab108fda34",
+  "sbatch_returncode": 0,
+  "sbatch_stderr": "",
+  "sbatch_stdout": "Submitted batch job 999999\n",
+  "script_abs_path": "/home/pietrosig/slurmctl/examples/basic/job2.sh",
+  "script_path": "job2.sh",
+  "stderr_template": "logs/job2-%j.err",
+  "stdout_template": "logs/job2-%j.out",
+  "submit_cwd": "/home/pietrosig/slurmctl/examples/basic",
+  "submitted_at": "2026-05-04T14:27:15.217150+00:00"
+}

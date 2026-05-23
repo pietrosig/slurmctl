@@ -181,13 +181,14 @@ In `watch`, selecting a job opens similar actions plus:
 - `C`: cancel a live Slurm job
 - `v`: start or clear visual selection
 - Arrow up/down or `j`/`k`: extend visual selection
-- `C` while visually selecting: cancel all selected live Slurm jobs
+- Enter while visually selecting: open selected-jobs actions
+- selected-jobs actions: cancel selected live jobs or rerun selected captured recipes
 
 The interactive `watch` view caches Slurm results briefly so large job lists do
 not make every redraw slow. Press `R` in the watch list to refresh manually.
 
-Cancel is guarded: you must type `CANCEL` and press Enter before `scancel` is
-called. With `--dry-run`, cancel only reports what would happen.
+Cancel and rerun actions ask for yes/no confirmation before running. With
+`--dry-run`, cancel only reports what would happen.
 
 ## Settings
 

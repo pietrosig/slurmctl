@@ -1126,14 +1126,18 @@ class InteractiveShell:
         self.args = args
         self.settings = load_settings()
         self.editing_setting: str | None = None
-        self.confirm_cancel = False
+        self.confirm_kind = ""
+        self.confirm_message = ""
+        self.confirm_payload: list[dict] = []
+        self.confirm_return_view = "watch"
+        self.confirm_success_view = "watch"
         self.pending_slurmctl_dir: str | None = None
         self.screen: curses.window | None = None
         self.view = "home"
         self.query = ""
         self.search_active = False
         self.watch_visual_anchor: int | None = None
-        self.pending_cancel_jobs: list[dict] = []
+        self.active_watch_records: list[dict] = []
         self.reset_selection()
         self.message = ""
         self.dirty = True
@@ -1195,7 +1199,7 @@ class InteractiveShell:
         if (
             self.view == "watch"
             and not self.watch_visual_active()
-            and not self.confirm_cancel
+            and self.view != "confirm"
             and self.watch_refresh_due()
         ):
             if self.schedule_watch_refresh():
@@ -1277,6 +1281,22 @@ class InteractiveShell:
             return [items[max(0, min(self.selected, len(items) - 1))]]
         start, end = bounds
         return items[start : end + 1]
+
+    def captured_records_for_jobs(self, jobs: list[dict]) -> list[dict]:
+        records = []
+        seen = set()
+        for job in jobs:
+            record = job.get("submission") or self.find_submission_for_job(
+                job.get("job_id")
+            )
+            if not record or not record.get("raw_args"):
+                continue
+            key = record.get("run_id") or tuple(record.get("raw_args") or [])
+            if key in seen:
+                continue
+            seen.add(key)
+            records.append(record)
+        return records
 
     def toggle_watch_visual(self) -> None:
         items = self.filtered_watch_jobs()
@@ -1472,6 +1492,10 @@ class InteractiveShell:
             self.draw_actions(height, width)
         elif self.view == "watch_actions":
             self.draw_watch_actions(height, width)
+        elif self.view == "watch_multi_actions":
+            self.draw_watch_multi_actions(height, width)
+        elif self.view == "confirm":
+            self.draw_confirm(height, width)
         elif self.view == "viewer":
             self.draw_viewer(height, width)
         elif self.view == "settings":
@@ -1487,6 +1511,8 @@ class InteractiveShell:
             "watch": "Search jobs",
             "actions": "Search actions",
             "watch_actions": "Search actions",
+            "watch_multi_actions": "Search actions",
+            "confirm": "Confirm",
             "viewer": "Search text",
             "settings": "Search/edit settings",
         }.get(self.view, "Search")
@@ -1500,13 +1526,13 @@ class InteractiveShell:
         self.screen.refresh()
 
     def status_line(self) -> str:
-        if self.confirm_cancel:
-            return self.message or "Type CANCEL and press Enter to confirm."
+        if self.view == "confirm":
+            return "Enter select | Y yes | F false | B back"
         if self.watch_visual_active():
             if self.message:
                 return self.message
             count = len(self.selected_watch_jobs())
-            return f"Visual: {count} selected | up/down extend | C cancel | v clear | B back"
+            return f"Visual: {count} selected | Enter actions | up/down extend | v clear | B back"
         return (
             self.message
             or "Enter select | arrows move | Tab search on/off | B back | q quit"
@@ -1522,6 +1548,8 @@ class InteractiveShell:
             "watch": "Watch",
             "actions": "Actions",
             "watch_actions": "Job Actions",
+            "watch_multi_actions": "Jobs Actions",
+            "confirm": "Confirm",
             "viewer": "Viewer",
             "settings": "Settings",
         }.get(self.view, self.view.title())
@@ -1541,6 +1569,10 @@ class InteractiveShell:
         elif self.view == "watch_actions":
             job = getattr(self, "active_job", None) or {}
             context = f"job {job.get('job_id') or '-'} | {job.get('state') or '-'}"
+        elif self.view == "watch_multi_actions":
+            context = f"{len(self.active_watch_records)} selected jobs"
+        elif self.view == "confirm":
+            context = self.confirm_kind or "confirm"
         elif self.view == "settings":
             context = str(config_path())
         else:
@@ -1717,6 +1749,30 @@ class InteractiveShell:
             actions, lambda item: f"{item['key']} {item['name']} {item['detail']}"
         )
 
+    def watch_multi_action_items(self) -> list[dict]:
+        actions = [
+            {
+                "key": "C",
+                "name": "cancel jobs",
+                "detail": "Prompt, then run scancel for selected live jobs",
+            },
+            {
+                "key": "R",
+                "name": "rerun jobs",
+                "detail": "Rerun captured sbatch recipes for selected jobs",
+            },
+            {"key": "B", "name": "back", "detail": "Return to watch"},
+        ]
+        return self.filter_items(
+            actions, lambda item: f"{item['key']} {item['name']} {item['detail']}"
+        )
+
+    def confirm_items(self) -> list[dict]:
+        return [
+            {"key": "Y", "name": "yes", "detail": "Continue"},
+            {"key": "F", "name": "false", "detail": "Cancel"},
+        ]
+
     def settings_items(self) -> list[dict]:
         items = [
             {
@@ -1791,15 +1847,6 @@ class InteractiveShell:
                 : width - 4
             ],
         )
-        if self.confirm_cancel:
-            self.add(
-                3,
-                2,
-                "Type CANCEL in the bottom bar and press Enter to cancel this job."[
-                    : width - 4
-                ],
-                curses.A_BOLD,
-            )
         items = self.watch_action_items()
         self.clamp_selected(len(items))
         start, visible = self.visible_slice(items, self.content_rows(height, 5))
@@ -1812,6 +1859,52 @@ class InteractiveShell:
                 idx + 5,
                 2,
                 f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4],
+                attr,
+            )
+
+    def draw_watch_multi_actions(self, height: int, width: int) -> None:
+        count = len(self.active_watch_records)
+        live_count = sum(
+            1 for job in self.active_watch_records if job.get("source") == "squeue"
+        )
+        captured_count = len(self.captured_records_for_jobs(self.active_watch_records))
+        self.add(
+            2,
+            2,
+            (
+                f"Selected: {count} jobs | cancelable: {live_count} | "
+                f"rerunnable: {captured_count}"
+            )[: width - 4],
+        )
+        items = self.watch_multi_action_items()
+        self.clamp_selected(len(items))
+        start, visible = self.visible_slice(items, self.content_rows(height, 5))
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
+            self.add(
+                idx + 5,
+                2,
+                f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4],
+                attr,
+            )
+
+    def draw_confirm(self, height: int, width: int) -> None:
+        self.add(2, 2, self.confirm_message[: width - 4], curses.A_BOLD)
+        items = self.confirm_items()
+        self.clamp_selected(len(items))
+        start, visible = self.visible_slice(items, self.content_rows(height, 4))
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
+            self.add(
+                idx + 4,
+                2,
+                f"{item['key']:<5} {item['name']:<8} {item['detail']}"[: width - 4],
                 attr,
             )
 
@@ -1890,7 +1983,14 @@ class InteractiveShell:
             and self.view == "watch"
             and self.watch_visual_active()
         ):
-            self.begin_cancel_jobs(self.selected_watch_jobs())
+            self.open_watch_multi_actions(self.selected_watch_jobs())
+            return False
+        if (
+            key in (ord("r"), ord("R"))
+            and self.view == "watch"
+            and self.watch_visual_active()
+        ):
+            self.open_watch_multi_actions(self.selected_watch_jobs())
             return False
         if key == ord("q") and not self.search_active:
             return True
@@ -1908,12 +2008,27 @@ class InteractiveShell:
             return False
         if key == curses.KEY_RESIZE:
             return False
+        if self.view == "confirm" and key in (ord("y"), ord("Y")):
+            self.perform_confirm("Y")
+            return False
+        if self.view == "confirm" and key in (
+            ord("f"),
+            ord("F"),
+            ord("n"),
+            ord("N"),
+        ):
+            self.perform_confirm("F")
+            return False
         if 32 <= key <= 126:
             char = chr(key)
             if self.view == "actions":
                 self.maybe_activate_shortcut(char)
             elif self.view == "watch_actions":
                 self.maybe_activate_watch_shortcut(char)
+            elif self.view == "watch_multi_actions":
+                self.maybe_activate_watch_multi_shortcut(char)
+            elif self.view == "confirm":
+                self.perform_confirm(char.upper())
             else:
                 self.message = "Press Tab to search."
         return False
@@ -1927,7 +2042,11 @@ class InteractiveShell:
             self.view = "show"
         elif self.view == "watch_actions":
             self.view = "watch"
-            self.confirm_cancel = False
+        elif self.view == "watch_multi_actions":
+            self.view = "watch"
+            self.active_watch_records = []
+        elif self.view == "confirm":
+            self.cancel_confirm()
         elif self.view == "viewer":
             self.view = "actions"
         elif self.view == "settings":
@@ -1940,9 +2059,6 @@ class InteractiveShell:
         self.message = ""
 
     def activate(self) -> None:
-        if self.confirm_cancel:
-            self.confirm_cancel_action()
-            return
         if self.view == "settings" and self.editing_setting:
             self.save_active_setting()
             return
@@ -1975,15 +2091,12 @@ class InteractiveShell:
             return
         if self.view == "watch":
             if self.watch_visual_active():
-                self.message = (
-                    "Press C to cancel the visual selection, or v to clear it."
-                )
+                self.open_watch_multi_actions(self.selected_watch_jobs())
                 return
             items = self.filtered_watch_jobs()
             if not items:
                 return
             self.active_job = items[self.selected]
-            self.confirm_cancel = False
             self.view = "watch_actions"
             self.query = ""
             self.search_active = False
@@ -1998,6 +2111,16 @@ class InteractiveShell:
             items = self.watch_action_items()
             if items:
                 self.perform_watch_action(items[self.selected]["key"])
+            return
+        if self.view == "watch_multi_actions":
+            items = self.watch_multi_action_items()
+            if items:
+                self.perform_watch_multi_action(items[self.selected]["key"])
+            return
+        if self.view == "confirm":
+            items = self.confirm_items()
+            if items:
+                self.perform_confirm(items[self.selected]["key"])
             return
         if self.view == "viewer":
             self.view = "actions"
@@ -2040,6 +2163,23 @@ class InteractiveShell:
         if upper in keys:
             self.perform_watch_action(upper)
 
+    def maybe_activate_watch_multi_shortcut(self, char: str) -> None:
+        self.query += char
+        upper = self.query.upper()
+        keys = {item["key"] for item in self.watch_multi_action_items()}
+        if upper in keys:
+            self.perform_watch_multi_action(upper)
+
+    def open_watch_multi_actions(self, jobs: list[dict]) -> None:
+        if not jobs:
+            self.message = "No jobs selected."
+            return
+        self.active_watch_records = list(jobs)
+        self.view = "watch_multi_actions"
+        self.query = ""
+        self.search_active = False
+        self.reset_selection()
+
     def perform_action(self, key: str) -> None:
         record = getattr(self, "active_record", None)
         if not record:
@@ -2060,7 +2200,7 @@ class InteractiveShell:
             self.message = f"Deleted run {record.get('run_id') or ''}".strip()
             return
         if key == "R":
-            self.suspend_and_rerun(record)
+            self.begin_rerun_records([record], return_view="actions", success_view="show")
             return
         if key == "OO":
             self.open_record_path_in_editor(record, "resolved_stdout_path")
@@ -2084,7 +2224,6 @@ class InteractiveShell:
             self.query = ""
             self.search_active = False
             self.reset_selection()
-            self.confirm_cancel = False
             return
         submission = job.get("submission") or self.find_submission_for_job(
             job.get("job_id")
@@ -2094,7 +2233,9 @@ class InteractiveShell:
             return
         if key == "R":
             if submission:
-                self.suspend_and_rerun(submission, return_view="watch")
+                self.begin_rerun_records(
+                    [submission], return_view="watch_actions", success_view="watch"
+                )
             else:
                 self.message = "No captured sbatch recipe for this job."
             return
@@ -2120,6 +2261,20 @@ class InteractiveShell:
             else:
                 self.message = "No captured metadata for this job."
 
+    def perform_watch_multi_action(self, key: str) -> None:
+        if key == "B":
+            self.view = "watch"
+            self.active_watch_records = []
+            self.query = ""
+            self.search_active = False
+            self.reset_selection()
+            return
+        if key == "C":
+            self.begin_cancel_jobs(self.active_watch_records)
+            return
+        if key == "R":
+            self.begin_rerun_jobs(self.active_watch_records)
+
     def begin_cancel_jobs(self, jobs: list[dict]) -> None:
         if not jobs:
             self.message = "No jobs selected."
@@ -2134,42 +2289,103 @@ class InteractiveShell:
             self.message = "Cancel is only available for live squeue jobs."
             self.query = ""
             return
-        self.pending_cancel_jobs = cancelable
-        self.confirm_cancel = True
-        self.query = ""
-        self.search_active = True
         job_ids = [str(job.get("job_id") or "") for job in cancelable]
-        if len(job_ids) == 1:
-            self.message = (
-                f"Confirm cancel for job {job_ids[0]}: type CANCEL and press Enter."
-            )
-        else:
-            preview = ", ".join(job_ids[:3])
-            suffix = "" if len(job_ids) <= 3 else f", +{len(job_ids) - 3} more"
-            self.message = f"Confirm cancel for {len(job_ids)} jobs ({preview}{suffix}): type CANCEL and press Enter."
+        target = f"job {job_ids[0]}" if len(job_ids) == 1 else f"{len(job_ids)} jobs"
+        self.begin_confirm(
+            "cancel",
+            cancelable,
+            f"You are about to cancel {target}. Continue?",
+            return_view=self.view,
+            success_view="watch",
+        )
 
-    def confirm_cancel_action(self) -> None:
-        jobs = self.pending_cancel_jobs
+    def begin_rerun_jobs(self, jobs: list[dict]) -> None:
+        records = self.captured_records_for_jobs(jobs)
+        self.begin_rerun_records(
+            records, return_view="watch_multi_actions", success_view="watch"
+        )
+
+    def begin_rerun_records(
+        self,
+        records: list[dict],
+        *,
+        return_view: str,
+        success_view: str,
+    ) -> None:
+        if not records:
+            self.message = "No captured sbatch recipes for selected jobs."
+            return
+        target = "job" if len(records) == 1 else f"{len(records)} jobs"
+        self.begin_confirm(
+            "rerun",
+            records,
+            f"You are about to rerun {target}. Continue?",
+            return_view=return_view,
+            success_view=success_view,
+        )
+
+    def begin_confirm(
+        self,
+        kind: str,
+        payload: list[dict],
+        message: str,
+        *,
+        return_view: str,
+        success_view: str,
+    ) -> None:
+        self.confirm_kind = kind
+        self.confirm_payload = list(payload)
+        self.confirm_message = message
+        self.confirm_return_view = return_view
+        self.confirm_success_view = success_view
+        self.view = "confirm"
+        self.query = ""
+        self.search_active = False
+        self.reset_selection()
+
+    def cancel_confirm(self) -> None:
+        return_view = self.confirm_return_view
+        self.confirm_kind = ""
+        self.confirm_message = ""
+        self.confirm_payload = []
+        self.view = return_view
+        self.query = ""
+        self.search_active = False
+        self.reset_selection()
+        self.message = "Action cancelled."
+
+    def perform_confirm(self, key: str) -> None:
+        if key in {"F", "N"}:
+            self.cancel_confirm()
+            return
+        if key != "Y":
+            self.message = "Choose yes or false."
+            return
+        kind = self.confirm_kind
+        payload = list(self.confirm_payload)
+        success_view = self.confirm_success_view
+        self.confirm_kind = ""
+        self.confirm_message = ""
+        self.confirm_payload = []
+        if kind == "cancel":
+            self.perform_confirmed_cancel(payload, success_view)
+            return
+        if kind == "rerun":
+            self.suspend_and_rerun_records(payload, success_view)
+
+    def perform_confirmed_cancel(self, jobs: list[dict], success_view: str) -> None:
         job_ids = [
             str(job.get("job_id") or "") for job in jobs if str(job.get("job_id") or "")
         ]
-        if self.query.strip() != "CANCEL":
-            self.message = "Cancel aborted; confirmation text did not match CANCEL."
-            self.confirm_cancel = False
-            self.pending_cancel_jobs = []
-            self.query = ""
-            self.search_active = False
-            return
         code, output = cancel_jobs(job_ids, dry_run=self.args.dry_run)
         target = (
             f"{len(job_ids)} jobs" if len(job_ids) != 1 else f"job {job_ids[0] or '-'}"
         )
         self.message = f"Cancel {target} exited {code}: {output}"
-        self.confirm_cancel = False
-        self.pending_cancel_jobs = []
+        self.active_watch_records = []
         self.query = ""
         self.search_active = False
-        self.view = "watch"
+        self.view = success_view
         self.reset_selection()
         self.schedule_watch_refresh()
 
@@ -2344,6 +2560,48 @@ class InteractiveShell:
             self.search_active = False
             self.reset_selection()
             self.message = f"Reran {record.get('script_path') or 'submission'}"
+        finally:
+            curses.reset_prog_mode()
+            self.screen.keypad(True)
+            self.screen.timeout(100)
+
+    def suspend_and_rerun_jobs(self, jobs: list[dict]) -> None:
+        self.suspend_and_rerun_records(self.captured_records_for_jobs(jobs), "watch")
+
+    def suspend_and_rerun_records(self, records: list[dict], success_view: str) -> None:
+        if not records:
+            self.message = "No captured sbatch recipes for selected jobs."
+            return
+
+        assert self.screen is not None
+        curses.def_prog_mode()
+        curses.endwin()
+        results: list[tuple[dict, int]] = []
+        try:
+            for record in records:
+                label = record.get("script_path") or record.get("job_id") or "submission"
+                print(f"\nrerunning {label}")
+                code = run_sbatch_args(
+                    list(record.get("raw_args") or []),
+                    submit_cwd=record.get("submit_cwd"),
+                    slurmctl_dir=self.args.slurmctl_dir,
+                    dry_run=self.args.dry_run,
+                    verbose=self.args.verbose,
+                )
+                results.append((record, code))
+            failed = sum(1 for _record, code in results if code != 0)
+            input(
+                f"\nreran {len(results)} jobs; {failed} failed. "
+                "Press Enter to return."
+            )
+            self.refresh_submissions_cache()
+            self.schedule_watch_refresh()
+            self.view = success_view
+            self.active_watch_records = []
+            self.query = ""
+            self.search_active = False
+            self.reset_selection()
+            self.message = f"Reran {len(results)} selected jobs; {failed} failed."
         finally:
             curses.reset_prog_mode()
             self.screen.keypad(True)

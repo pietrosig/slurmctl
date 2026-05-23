@@ -1844,33 +1844,53 @@ class InteractiveShell:
                 attr,
             )
 
-    def watch_job_detail_lines(self, job: dict) -> list[str]:
+    def watch_job_detail_rows(self, job: dict) -> tuple[str, list[str]]:
         submission = job.get("submission") or self.find_submission_for_job(
             job.get("job_id")
         )
-        lines = [
+        title = (
+            f"Job {job.get('job_id') or '-'}  "
+            f"{job.get('state') or '-'}  {job.get('job_name') or '-'}"
+        )
+        rows = [
             (
-                f"Selected: {job.get('job_id') or '-'} "
-                f"{job.get('state') or '-'} {job.get('job_name') or '-'}"
+                f"{'elapsed':<10} {job.get('elapsed') or '-':<12} "
+                f"{'requested':<10} {job.get('time_limit') or '-':<12} "
+                f"{'left':<6} {job.get('time_left') or '-'}"
             ),
             (
-                f"Time: elapsed {job.get('elapsed') or '-'} | "
-                f"requested {job.get('time_limit') or '-'} | "
-                f"left {job.get('time_left') or '-'}"
+                f"{'nodes':<10} {job.get('nodes') or '-':<12} "
+                f"{'reason':<10} {job.get('reason') or '-'}"
             ),
-            f"Nodes: {job.get('nodes') or '-'} | Reason: {job.get('reason') or '-'}",
         ]
         if submission:
-            lines.append(f"Script: {submission.get('script_path') or '-'}")
-        return lines
+            rows.append(f"{'script':<10} {submission.get('script_path') or '-'}")
+        return title, rows
+
+    def draw_watch_job_details(
+        self, y: int, x: int, width: int, job: dict
+    ) -> int:
+        title, rows = self.watch_job_detail_rows(job)
+        box_width = max(20, width - x - 1)
+        inner_width = max(0, box_width - 2)
+        title_text = f" {title} "
+        border = "+" + ("-" * inner_width) + "+"
+        if len(title_text) < inner_width:
+            border = "+" + title_text + ("-" * (inner_width - len(title_text))) + "+"
+        self.add(y, x, border[:box_width], curses.A_BOLD)
+        for idx, row in enumerate(rows, start=1):
+            content = " " + row[: max(0, inner_width - 2)]
+            self.add(
+                y + idx,
+                x,
+                ("|" + content.ljust(inner_width) + "|")[:box_width],
+            )
+        self.add(y + len(rows) + 1, x, ("+" + ("-" * inner_width) + "+")[:box_width])
+        return y + len(rows) + 3
 
     def draw_watch_actions(self, height: int, width: int) -> None:
         job = getattr(self, "active_job", None) or {}
-        detail_lines = self.watch_job_detail_lines(job)
-        for idx, line in enumerate(detail_lines):
-            attr = curses.A_BOLD if idx == 0 else curses.A_NORMAL
-            self.add(idx + 2, 2, line[: width - 4], attr)
-        action_start = 2 + len(detail_lines) + 1
+        action_start = self.draw_watch_job_details(2, 2, width, job)
         items = self.watch_action_items()
         self.clamp_selected(len(items))
         start, visible = self.visible_slice(

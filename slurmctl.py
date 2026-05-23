@@ -1014,7 +1014,7 @@ def load_live_watch_jobs(
 ) -> tuple[list[dict], str]:
     squeue = shutil.which("squeue")
     if squeue:
-        command = [squeue, "--me", "--noheader", "--format=%i|%j|%T|%M|%D|%R"]
+        command = [squeue, "--me", "--noheader", "--format=%i|%j|%T|%M|%l|%L|%D|%R"]
         try:
             proc = subprocess.run(
                 command, text=True, capture_output=True, timeout=timeout_seconds
@@ -1029,10 +1029,10 @@ def load_live_watch_jobs(
         if proc.returncode == 0:
             jobs = []
             for line in proc.stdout.splitlines():
-                parts = line.split("|", 5)
-                if len(parts) != 6:
+                parts = line.split("|", 7)
+                if len(parts) != 8:
                     continue
-                job_id, name, state, elapsed, nodes, reason = [
+                job_id, name, state, elapsed, time_limit, time_left, nodes, reason = [
                     part.strip() for part in parts
                 ]
                 jobs.append(
@@ -1042,6 +1042,8 @@ def load_live_watch_jobs(
                         "job_name": name,
                         "state": state,
                         "elapsed": elapsed,
+                        "time_limit": time_limit,
+                        "time_left": time_left,
                         "nodes": nodes,
                         "reason": reason,
                     }
@@ -1059,6 +1061,8 @@ def load_live_watch_jobs(
                 or record.get("script_path"),
                 "state": "captured",
                 "elapsed": "-",
+                "time_limit": "-",
+                "time_left": "-",
                 "nodes": "-",
                 "reason": "squeue not found",
                 "submission": record,
@@ -1235,6 +1239,8 @@ class InteractiveShell:
                     "job_name",
                     "state",
                     "elapsed",
+                    "time_limit",
+                    "time_left",
                     "nodes",
                     "reason",
                     "source",
@@ -1838,25 +1844,45 @@ class InteractiveShell:
                 attr,
             )
 
+    def watch_job_detail_lines(self, job: dict) -> list[str]:
+        submission = job.get("submission") or self.find_submission_for_job(
+            job.get("job_id")
+        )
+        lines = [
+            (
+                f"Selected: {job.get('job_id') or '-'} "
+                f"{job.get('state') or '-'} {job.get('job_name') or '-'}"
+            ),
+            (
+                f"Time: elapsed {job.get('elapsed') or '-'} | "
+                f"requested {job.get('time_limit') or '-'} | "
+                f"left {job.get('time_left') or '-'}"
+            ),
+            f"Nodes: {job.get('nodes') or '-'} | Reason: {job.get('reason') or '-'}",
+        ]
+        if submission:
+            lines.append(f"Script: {submission.get('script_path') or '-'}")
+        return lines
+
     def draw_watch_actions(self, height: int, width: int) -> None:
         job = getattr(self, "active_job", None) or {}
-        self.add(
-            2,
-            2,
-            f"Selected: {job.get('job_id') or '-'} {job.get('state') or '-'} {job.get('job_name') or '-'}"[
-                : width - 4
-            ],
-        )
+        detail_lines = self.watch_job_detail_lines(job)
+        for idx, line in enumerate(detail_lines):
+            attr = curses.A_BOLD if idx == 0 else curses.A_NORMAL
+            self.add(idx + 2, 2, line[: width - 4], attr)
+        action_start = 2 + len(detail_lines) + 1
         items = self.watch_action_items()
         self.clamp_selected(len(items))
-        start, visible = self.visible_slice(items, self.content_rows(height, 5))
+        start, visible = self.visible_slice(
+            items, self.content_rows(height, action_start)
+        )
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = (
                 curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             )
             self.add(
-                idx + 5,
+                idx + action_start,
                 2,
                 f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4],
                 attr,

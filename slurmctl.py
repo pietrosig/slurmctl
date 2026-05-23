@@ -1892,21 +1892,29 @@ class InteractiveShell:
             )
 
     def draw_confirm(self, height: int, width: int) -> None:
-        self.add(2, 2, self.confirm_message[: width - 4], curses.A_BOLD)
         items = self.confirm_items()
         self.clamp_selected(len(items))
-        start, visible = self.visible_slice(items, self.content_rows(height, 4))
-        for idx, item in enumerate(visible):
-            absolute_idx = start + idx
-            attr = (
-                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
-            )
-            self.add(
-                idx + 4,
-                2,
-                f"{item['key']:<5} {item['name']:<8} {item['detail']}"[: width - 4],
-                attr,
-            )
+        message = self.confirm_message or "Continue?"
+        box_width = min(max(44, len(message) + 6), max(20, width - 4))
+        box_height = 7
+        top = max(2, (height - box_height) // 2)
+        left = max(0, (width - box_width) // 2)
+        inner_width = max(0, box_width - 2)
+
+        border = "+" + ("-" * inner_width) + "+"
+        self.add(top, left, border)
+        for row in range(1, box_height - 1):
+            self.add(top + row, left, "|" + (" " * inner_width) + "|")
+        self.add(top + box_height - 1, left, border)
+        self.add(top + 1, left + 2, "Confirm", curses.A_BOLD)
+        self.add(top + 3, left + 2, message[: max(0, box_width - 4)])
+
+        option_x = left + 2
+        for idx, item in enumerate(items):
+            label = f"{item['key']} {item['name']}"
+            attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
+            self.add(top + 5, option_x, f" {label} ", attr)
+            option_x += len(label) + 5
 
     def draw_viewer(self, height: int, width: int) -> None:
         path = self.viewer_path

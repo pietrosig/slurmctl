@@ -189,8 +189,10 @@ not make every redraw slow. Press `R` in the watch list to refresh manually.
 Select `Load more` at the end of the finished jobs to expand the `sacct` window
 by 12 hours.
 
-Cancel and rerun actions ask for yes/false confirmation before running. With
-`--dry-run`, cancel only reports what would happen.
+Cancel and rerun actions ask for yes/false confirmation before running. If a
+captured rerun recipe has a Slurm dependency, rerun asks whether to keep the
+exact recipe or remove dependency options. With `--dry-run`, cancel only reports
+what would happen.
 
 ## Settings
 

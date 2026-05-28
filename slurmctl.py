@@ -55,6 +55,8 @@ OPTIONS_WITH_VALUES = {
     "--array": "array",
     "-a": "array",
     "--chdir": "chdir",
+    "--dependency": "dependency",
+    "-d": "dependency",
 }
 
 NO_SCRIPT_LONG_OPTIONS = {
@@ -696,6 +698,194 @@ def run_sbatch_args(
         cwd = submit_cwd if submit_cwd and Path(submit_cwd).exists() else None
         proc = subprocess.run([str(wrapper), *raw_args], cwd=cwd, env=env)
         return proc.returncode
+
+
+def raw_sbatch_dependency_values(
+    raw_args: list[str], script_path: object = None
+) -> list[str]:
+    values = []
+    script_text = str(script_path or "")
+    i = 0
+    while i < len(raw_args):
+        arg = raw_args[i]
+        if script_text and arg == script_text:
+            break
+        if arg == "--":
+            break
+        if arg == "--dependency" or arg == "-d":
+            if i + 1 < len(raw_args):
+                values.append(raw_args[i + 1])
+                i += 2
+            else:
+                i += 1
+            continue
+        if arg.startswith("--dependency="):
+            values.append(arg.split("=", 1)[1])
+            i += 1
+            continue
+        if arg.startswith("-d") and arg != "-d":
+            values.append(arg[2:])
+            i += 1
+            continue
+        if (not arg.startswith("-") or arg == "-") and not script_text:
+            break
+        i += 1
+    return [value for value in values if value]
+
+
+def remove_sbatch_dependency_args(
+    raw_args: list[str], script_path: object = None
+) -> list[str]:
+    cleaned = []
+    script_text = str(script_path or "")
+    i = 0
+    parsing_options = True
+    while i < len(raw_args):
+        arg = raw_args[i]
+        if not parsing_options:
+            cleaned.append(arg)
+            i += 1
+            continue
+        if script_text and arg == script_text:
+            cleaned.extend(raw_args[i:])
+            break
+        if arg == "--":
+            cleaned.extend(raw_args[i:])
+            break
+        if arg == "--dependency" or arg == "-d":
+            i += 2 if i + 1 < len(raw_args) else 1
+            continue
+        if arg.startswith("--dependency=") or (arg.startswith("-d") and arg != "-d"):
+            i += 1
+            continue
+        cleaned.append(arg)
+        if (not arg.startswith("-") or arg == "-") and not script_text:
+            parsing_options = False
+        i += 1
+    return cleaned
+
+
+def record_dependency_values(record: dict) -> list[str]:
+    values = []
+    for options_key in (
+        "normalized_options",
+        "parsed_cli_options",
+        "parsed_script_directives",
+    ):
+        options = record.get(options_key) or {}
+        if isinstance(options, dict) and options.get("dependency"):
+            values.append(str(options["dependency"]))
+    values.extend(
+        raw_sbatch_dependency_values(
+            list(record.get("raw_args") or []), record.get("script_path")
+        )
+    )
+    deduped = []
+    seen = set()
+    for value in values:
+        if value in seen:
+            continue
+        seen.add(value)
+        deduped.append(value)
+    return deduped
+
+
+def sbatch_directive_has_dependency(line: str) -> bool:
+    stripped = line.strip()
+    if not stripped.startswith("#SBATCH"):
+        return False
+    body = stripped[len("#SBATCH") :].strip()
+    if not body:
+        return False
+    try:
+        tokens = shlex.split(body)
+    except ValueError:
+        return False
+    return bool(raw_sbatch_dependency_values(tokens))
+
+
+def record_script_has_dependency_directive(record: dict) -> bool:
+    source = resolved_record_script_path(record)
+    if source is None:
+        return False
+    try:
+        return any(
+            sbatch_directive_has_dependency(line)
+            for line in source.read_text(encoding="utf-8").splitlines()
+        )
+    except OSError:
+        return False
+
+
+def resolved_record_script_path(record: dict) -> Path | None:
+    script_path = record.get("script_abs_path") or record.get("script_path")
+    if not script_path:
+        return None
+    path = Path(str(script_path))
+    if path.is_absolute():
+        return path
+    submit_cwd = record.get("submit_cwd")
+    if submit_cwd:
+        return Path(str(submit_cwd)) / path
+    return path
+
+
+def dependency_free_script_copy(record: dict, temp_dir: Path) -> tuple[Path | None, str]:
+    source = resolved_record_script_path(record)
+    if source is None:
+        return None, ""
+    try:
+        lines = source.read_text(encoding="utf-8").splitlines(keepends=True)
+    except OSError as exc:
+        return None, f"could not inspect script dependency directives: {exc}"
+    filtered = [line for line in lines if not sbatch_directive_has_dependency(line)]
+    if len(filtered) == len(lines):
+        return None, ""
+    target = temp_dir / f"{source.stem}-no-dependency{source.suffix}"
+    target.write_text("".join(filtered), encoding="utf-8")
+    try:
+        target.chmod(source.stat().st_mode & 0o777)
+    except OSError:
+        pass
+    return target, f"removed dependency directives from {source}"
+
+
+def replace_record_script_arg(
+    raw_args: list[str], record: dict, replacement: Path
+) -> list[str]:
+    script_path = str(record.get("script_path") or "")
+    if not script_path:
+        return raw_args
+    replaced = []
+    did_replace = False
+    for arg in raw_args:
+        if not did_replace and arg == script_path:
+            replaced.append(str(replacement))
+            did_replace = True
+        else:
+            replaced.append(arg)
+    return replaced
+
+
+def rerun_args_without_dependencies(
+    record: dict, temp_dir: Path
+) -> tuple[list[str], list[str]]:
+    raw_args = remove_sbatch_dependency_args(
+        list(record.get("raw_args") or []), record.get("script_path")
+    )
+    notes = []
+    script_copy, note = dependency_free_script_copy(record, temp_dir)
+    if note:
+        notes.append(note)
+    if script_copy is not None:
+        raw_args = replace_record_script_arg(raw_args, record, script_copy)
+    return raw_args, notes
+
+
+def record_has_dependency(record: dict) -> bool:
+    return bool(
+        record_dependency_values(record)
+    ) or record_script_has_dependency_directive(record)
 
 
 def sbatch(args: argparse.Namespace) -> int:
@@ -1575,6 +1765,8 @@ class InteractiveShell:
 
     def status_line(self) -> str:
         if self.view == "confirm":
+            if self.confirm_kind == "rerun_dependency":
+                return "Enter select | E exact | D no dependency | B back"
             return "Enter select | Y yes | F false | B back"
         if self.watch_visual_active():
             if self.message:
@@ -1832,6 +2024,12 @@ class InteractiveShell:
         )
 
     def confirm_items(self) -> list[dict]:
+        if self.confirm_kind == "rerun_dependency":
+            return [
+                {"key": "E", "name": "exact", "detail": "Keep dependency options"},
+                {"key": "D", "name": "no dependency", "detail": "Remove dependency options"},
+                {"key": "B", "name": "back", "detail": "Return without rerunning"},
+            ]
         return [
             {"key": "Y", "name": "yes", "detail": "Continue"},
             {"key": "F", "name": "false", "detail": "Cancel"},
@@ -2440,6 +2638,21 @@ class InteractiveShell:
             self.message = "No captured sbatch recipes for selected jobs."
             return
         target = "job" if len(records) == 1 else f"{len(records)} jobs"
+        dependency_count = sum(1 for record in records if record_has_dependency(record))
+        if dependency_count:
+            subject = (
+                "This job has dependencies"
+                if dependency_count == 1 and len(records) == 1
+                else f"{dependency_count} selected jobs have dependencies"
+            )
+            self.begin_confirm(
+                "rerun_dependency",
+                records,
+                f"{subject}. Rerun how?",
+                return_view=return_view,
+                success_view=success_view,
+            )
+            return
         self.begin_confirm(
             "rerun",
             records,
@@ -2479,15 +2692,29 @@ class InteractiveShell:
         self.message = "Action cancelled."
 
     def perform_confirm(self, key: str) -> None:
+        kind = self.confirm_kind
+        payload = list(self.confirm_payload)
+        success_view = self.confirm_success_view
+        if kind == "rerun_dependency":
+            if key in {"B", "F", "N"}:
+                self.cancel_confirm()
+                return
+            if key not in {"E", "D"}:
+                self.message = "Choose exact, no dependency, or back."
+                return
+            self.confirm_kind = ""
+            self.confirm_message = ""
+            self.confirm_payload = []
+            self.suspend_and_rerun_records(
+                payload, success_view, remove_dependency=(key == "D")
+            )
+            return
         if key in {"F", "N"}:
             self.cancel_confirm()
             return
         if key != "Y":
             self.message = "Choose yes or false."
             return
-        kind = self.confirm_kind
-        payload = list(self.confirm_payload)
-        success_view = self.confirm_success_view
         self.confirm_kind = ""
         self.confirm_message = ""
         self.confirm_payload = []
@@ -2692,7 +2919,13 @@ class InteractiveShell:
     def suspend_and_rerun_jobs(self, jobs: list[dict]) -> None:
         self.suspend_and_rerun_records(self.captured_records_for_jobs(jobs), "watch")
 
-    def suspend_and_rerun_records(self, records: list[dict], success_view: str) -> None:
+    def suspend_and_rerun_records(
+        self,
+        records: list[dict],
+        success_view: str,
+        *,
+        remove_dependency: bool = False,
+    ) -> None:
         if not records:
             self.message = "No captured sbatch recipes for selected jobs."
             return
@@ -2702,17 +2935,32 @@ class InteractiveShell:
         curses.endwin()
         results: list[tuple[dict, int]] = []
         try:
-            for record in records:
-                label = record.get("script_path") or record.get("job_id") or "submission"
-                print(f"\nrerunning {label}")
-                code = run_sbatch_args(
-                    list(record.get("raw_args") or []),
-                    submit_cwd=record.get("submit_cwd"),
-                    slurmctl_dir=self.args.slurmctl_dir,
-                    dry_run=self.args.dry_run,
-                    verbose=self.args.verbose,
-                )
-                results.append((record, code))
+            with tempfile.TemporaryDirectory(prefix="slurmctl-rerun-") as tmp:
+                temp_dir = Path(tmp)
+                for record in records:
+                    label = (
+                        record.get("script_path")
+                        or record.get("job_id")
+                        or "submission"
+                    )
+                    raw_args = list(record.get("raw_args") or [])
+                    notes: list[str] = []
+                    if remove_dependency:
+                        raw_args, notes = rerun_args_without_dependencies(
+                            record, temp_dir
+                        )
+                    suffix = " without dependencies" if remove_dependency else ""
+                    print(f"\nrerunning {label}{suffix}")
+                    for note in notes:
+                        print(f"  {note}")
+                    code = run_sbatch_args(
+                        raw_args,
+                        submit_cwd=record.get("submit_cwd"),
+                        slurmctl_dir=self.args.slurmctl_dir,
+                        dry_run=self.args.dry_run,
+                        verbose=self.args.verbose,
+                    )
+                    results.append((record, code))
             failed = sum(1 for _record, code in results if code != 0)
             input(
                 f"\nreran {len(results)} jobs; {failed} failed. "
@@ -2725,7 +2973,10 @@ class InteractiveShell:
             self.query = ""
             self.search_active = False
             self.reset_selection()
-            self.message = f"Reran {len(results)} selected jobs; {failed} failed."
+            suffix = " without dependencies" if remove_dependency else ""
+            self.message = (
+                f"Reran {len(results)} selected jobs{suffix}; {failed} failed."
+            )
         finally:
             curses.reset_prog_mode()
             self.screen.keypad(True)

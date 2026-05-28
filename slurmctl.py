@@ -842,6 +842,8 @@ def normalize_state(state: object) -> str:
 
 
 def job_group(job: dict) -> str:
+    if job.get("source") == "load_more":
+        return "finished"
     state = normalize_state(job.get("state"))
     if state in RUNNING_STATES:
         return "running"
@@ -899,6 +901,8 @@ def watch_sort_key(job: dict) -> tuple[int, int, str, str]:
     order = {"running": 0, "pending": 1, "finished": 2, "other": 3}
     group = job_group(job)
     job_id = str(job.get("job_id") or "")
+    if is_watch_load_more_item(job):
+        return (order["finished"], 1, "", job_id)
     if group == "finished":
         return (order[group], -parse_job_id_number(job_id), "", job_id)
     elapsed = parse_elapsed_seconds(job.get("elapsed"))
@@ -918,10 +922,16 @@ def sort_watch_jobs(jobs: list[dict]) -> list[dict]:
 def watch_stats(jobs: list[dict]) -> dict[str, int]:
     stats = {"running": 0, "pending": 0, "finished": 0}
     for job in jobs:
+        if is_watch_load_more_item(job):
+            continue
         group = job_group(job)
         if group in stats:
             stats[group] += 1
     return stats
+
+
+def is_watch_load_more_item(job: dict) -> bool:
+    return job.get("source") == "load_more"
 
 
 def parse_slurm_datetime(value: object) -> dt.datetime | None:
@@ -1110,7 +1120,7 @@ def watch(args: argparse.Namespace) -> int:
     print(
         f"stats: running {stats['running']} | "
         f"pending {stats['pending']} | "
-        f"finished last 12h {stats['finished']}"
+        f"finished last 24h {stats['finished']}"
     )
     print("JOB_ID   STATE        ELAPSED    NODES  NAME                 REASON")
     for job in jobs:
@@ -1151,6 +1161,8 @@ class InteractiveShell:
         self.watch_loaded_at = 0.0
         self.watch_refresh_interval_seconds = 2.0
         self.watch_finished_refresh_interval_seconds = 60.0
+        self.watch_finished_hours = 24
+        self.watch_finished_hours_step = 12
         self.watch_timeout_seconds = 3.0
         self.watch_refreshing = False
         self.watch_refresh_announce = False
@@ -1183,6 +1195,7 @@ class InteractiveShell:
         curses.curs_set(0)
         screen.keypad(True)
         screen.timeout(100)
+        self.schedule_watch_refresh()
         while True:
             self.tick()
             if self.dirty:
@@ -1230,8 +1243,9 @@ class InteractiveShell:
         )
 
     def filtered_watch_jobs(self) -> list[dict]:
+        items = [*self.watch_cache, self.watch_load_more_item()]
         return self.filter_items(
-            self.watch_cache,
+            items,
             lambda item: " ".join(
                 str(item.get(key) or "")
                 for key in (
@@ -1247,6 +1261,20 @@ class InteractiveShell:
                 )
             ),
         )
+
+    def watch_load_more_item(self) -> dict:
+        next_hours = self.watch_finished_hours + self.watch_finished_hours_step
+        return {
+            "source": "load_more",
+            "job_id": "",
+            "job_name": "Load more",
+            "state": "LOAD MORE",
+            "elapsed": "",
+            "time_limit": "",
+            "time_left": "",
+            "nodes": "",
+            "reason": f"show finished jobs from last {next_hours}h",
+        }
 
     def filtered_scripts(self) -> list[dict]:
         return self.filter_items(self.scripts_cache, lambda item: item["path"])
@@ -1280,13 +1308,17 @@ class InteractiveShell:
 
     def selected_watch_jobs(self) -> list[dict]:
         items = self.filtered_watch_jobs()
-        if not items:
+        selectable = [item for item in items if not is_watch_load_more_item(item)]
+        if not selectable:
             return []
         bounds = self.watch_visual_bounds(len(items))
         if bounds is None:
-            return [items[max(0, min(self.selected, len(items) - 1))]]
+            item = items[max(0, min(self.selected, len(items) - 1))]
+            return [] if is_watch_load_more_item(item) else [item]
         start, end = bounds
-        return items[start : end + 1]
+        return [
+            item for item in items[start : end + 1] if not is_watch_load_more_item(item)
+        ]
 
     def captured_records_for_jobs(self, jobs: list[dict]) -> list[dict]:
         records = []
@@ -1308,6 +1340,10 @@ class InteractiveShell:
         items = self.filtered_watch_jobs()
         if not items:
             self.message = "No watch jobs to select."
+            return
+        selected = items[max(0, min(self.selected, len(items) - 1))]
+        if is_watch_load_more_item(selected):
+            self.message = "Press Enter on Load more to expand finished jobs."
             return
         if self.watch_visual_active():
             self.watch_visual_anchor = None
@@ -1337,7 +1373,9 @@ class InteractiveShell:
             >= self.watch_finished_refresh_interval_seconds
         )
 
-    def schedule_watch_refresh(self, *, announce: bool = False) -> bool:
+    def schedule_watch_refresh(
+        self, *, announce: bool = False, force_finished: bool = False
+    ) -> bool:
         if self.watch_refreshing:
             if announce:
                 self.message = "Watch refresh already in progress."
@@ -1345,7 +1383,9 @@ class InteractiveShell:
 
         self.watch_next_token += 1
         token = self.watch_next_token
-        refresh_finished = announce or self.watch_finished_refresh_due()
+        refresh_finished = (
+            force_finished or announce or self.watch_finished_refresh_due()
+        )
         self.watch_active_token = token
         self.watch_refreshing = True
         self.watch_refresh_announce = announce
@@ -1361,6 +1401,7 @@ class InteractiveShell:
                 list(self.watch_finished_cache),
                 self.watch_finished_source,
                 self.watch_finished_loaded_at,
+                self.watch_finished_hours,
             ),
             daemon=True,
         )
@@ -1374,6 +1415,7 @@ class InteractiveShell:
         cached_finished: list[dict],
         cached_finished_source: str,
         cached_finished_loaded_at: float,
+        finished_hours: int,
     ) -> None:
         try:
             finished_jobs = cached_finished
@@ -1381,7 +1423,7 @@ class InteractiveShell:
             finished_loaded_at = cached_finished_loaded_at
             if refresh_finished:
                 finished_jobs, finished_source = load_recent_finished_jobs(
-                    self.watch_timeout_seconds, hours=24
+                    self.watch_timeout_seconds, hours=finished_hours
                 )
                 finished_loaded_at = time.monotonic()
             live_jobs, live_source = load_live_watch_jobs(
@@ -1477,7 +1519,7 @@ class InteractiveShell:
             self.refresh_scripts_cache()
         elif view == "show":
             self.refresh_submissions_cache()
-        elif view == "watch":
+        elif view == "watch" and self.watch_refresh_due():
             self.schedule_watch_refresh()
 
     def draw(self) -> None:
@@ -1562,7 +1604,12 @@ class InteractiveShell:
         if self.view == "show":
             context = f"{len(self.filtered_submissions())} shown / {len(self.submissions_cache)} total"
         elif self.view == "watch":
-            context = f"{len(self.filtered_watch_jobs())} shown / {len(self.watch_cache)} total | {self.watch_source}"
+            shown = sum(
+                1
+                for item in self.filtered_watch_jobs()
+                if not is_watch_load_more_item(item)
+            )
+            context = f"{shown} shown / {len(self.watch_cache)} total | {self.watch_source}"
             if self.watch_refreshing:
                 context += " | refreshing"
             if self.watch_error:
@@ -1646,7 +1693,7 @@ class InteractiveShell:
         stats_line = (
             f"running {stats['running']} | "
             f"pending {stats['pending']} | "
-            f"finished last 12h {stats['finished']}"
+            f"finished last {self.watch_finished_hours}h {stats['finished']}"
         )
         self.add(2, 0, stats_line[: width - 1], curses.A_BOLD)
         header = f"{'JOB_ID':<8} {'STATE':<12} {'ELAPSED':<10} {'NODES':<6} {'NAME':<22} REASON"
@@ -1681,14 +1728,25 @@ class InteractiveShell:
             )
             if absolute_idx == self.selected:
                 attr |= curses.A_BOLD
-            row = (
-                f"{item.get('job_id') or '-':<8} "
-                f"{item.get('state') or '-':<12} "
-                f"{item.get('elapsed') or '-':<10} "
-                f"{item.get('nodes') or '-':<6} "
-                f"{item.get('job_name') or '-':<22} "
-                f"{item.get('reason') or '-'}"
-            )
+            if is_watch_load_more_item(item):
+                row = (
+                    f"{'':<8} "
+                    f"{'':<12} "
+                    f"{'':<10} "
+                    f"{'':<6} "
+                    f"{'[ Load more ]':<22} "
+                    f"{item.get('reason') or '-'}"
+                )
+                attr |= curses.A_BOLD
+            else:
+                row = (
+                    f"{item.get('job_id') or '-':<8} "
+                    f"{item.get('state') or '-':<12} "
+                    f"{item.get('elapsed') or '-':<10} "
+                    f"{item.get('nodes') or '-':<6} "
+                    f"{item.get('job_name') or '-':<22} "
+                    f"{item.get('reason') or '-'}"
+                )
             self.add(row_y, 0, row[: width - 1], attr)
             row_y += 1
             previous_group = current_group
@@ -2151,6 +2209,9 @@ class InteractiveShell:
             if not items:
                 return
             self.active_job = items[self.selected]
+            if is_watch_load_more_item(self.active_job):
+                self.load_more_finished_jobs()
+                return
             self.view = "watch_actions"
             self.query = ""
             self.search_active = False
@@ -2233,6 +2294,15 @@ class InteractiveShell:
         self.query = ""
         self.search_active = False
         self.reset_selection()
+
+    def load_more_finished_jobs(self) -> None:
+        self.watch_finished_hours += self.watch_finished_hours_step
+        if self.schedule_watch_refresh(announce=True, force_finished=True):
+            self.message = (
+                f"Loading finished jobs from last {self.watch_finished_hours}h..."
+            )
+        else:
+            self.watch_finished_hours -= self.watch_finished_hours_step
 
     def perform_action(self, key: str) -> None:
         record = getattr(self, "active_record", None)

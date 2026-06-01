@@ -1087,19 +1087,28 @@ def parse_job_id_number(job_id: object) -> int:
     return int("".join(digits))
 
 
-def watch_sort_key(job: dict) -> tuple[int, int, str, str]:
+def watch_sort_key(job: dict) -> tuple[int, float, int, str, str]:
     order = {"running": 0, "pending": 1, "finished": 2, "other": 3}
     group = job_group(job)
     job_id = str(job.get("job_id") or "")
     if is_watch_load_more_item(job):
-        return (order["finished"], 1, "", job_id)
+        return (order["finished"], float("inf"), 0, "", job_id)
     if group == "finished":
-        return (order[group], -parse_job_id_number(job_id), "", job_id)
+        ended_at = parse_slurm_datetime(job.get("ended_at"))
+        ended_key = -ended_at.timestamp() if ended_at else 0.0
+        return (
+            order[group],
+            ended_key,
+            -parse_job_id_number(job_id),
+            "",
+            job_id,
+        )
     elapsed = parse_elapsed_seconds(job.get("elapsed"))
     elapsed_key = elapsed if group == "running" else 0
     return (
         order[group],
-        elapsed_key,
+        float(elapsed_key),
+        0,
         str(job.get("job_name") or ""),
         job_id,
     )
@@ -1188,6 +1197,7 @@ def load_recent_finished_jobs(
                 "state": state,
                 "elapsed": elapsed,
                 "nodes": nodes or "-",
+                "ended_at": ended_at,
                 "reason": f"ended {ended_at}",
             }
         )

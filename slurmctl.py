@@ -1133,6 +1133,14 @@ def is_watch_load_more_item(job: dict) -> bool:
     return job.get("source") == "load_more"
 
 
+def live_watch_job_ids(jobs: list[dict]) -> set[str]:
+    return {
+        str(job.get("job_id") or "")
+        for job in jobs
+        if job.get("source") == "squeue" and str(job.get("job_id") or "")
+    }
+
+
 def parse_slurm_datetime(value: object) -> dt.datetime | None:
     text = str(value or "").strip()
     if not text or text in {"Unknown", "N/A"}:
@@ -1592,6 +1600,7 @@ class InteractiveShell:
         self.watch_refreshing = True
         self.watch_refresh_announce = announce
         self.watch_error = ""
+        previous_live_job_ids = live_watch_job_ids(self.watch_cache)
         if announce:
             self.message = "Refreshing watch..."
 
@@ -1604,6 +1613,7 @@ class InteractiveShell:
                 self.watch_finished_source,
                 self.watch_finished_loaded_at,
                 self.watch_finished_hours,
+                previous_live_job_ids,
             ),
             daemon=True,
         )
@@ -1618,6 +1628,7 @@ class InteractiveShell:
         cached_finished_source: str,
         cached_finished_loaded_at: float,
         finished_hours: int,
+        previous_live_job_ids: set[str],
     ) -> None:
         try:
             finished_jobs = cached_finished
@@ -1631,6 +1642,26 @@ class InteractiveShell:
             live_jobs, live_source = load_live_watch_jobs(
                 self.args.slurmctl_dir, timeout_seconds=self.watch_timeout_seconds
             )
+            disappeared_live_ids = previous_live_job_ids - live_watch_job_ids(live_jobs)
+            refresh_for_disappeared = (
+                bool(disappeared_live_ids)
+                and not refresh_finished
+                and live_source.startswith("squeue --me")
+            )
+            if refresh_for_disappeared:
+                finished_jobs, finished_source = load_recent_finished_jobs(
+                    self.watch_timeout_seconds, hours=finished_hours
+                )
+                finished_job_ids = {
+                    str(job.get("job_id") or "") for job in finished_jobs
+                }
+                if disappeared_live_ids & finished_job_ids:
+                    finished_loaded_at = time.monotonic()
+                elif finished_source.startswith("sacct last"):
+                    finished_loaded_at = 0.0
+                else:
+                    finished_loaded_at = time.monotonic()
+                refresh_finished = True
             jobs, source = combine_watch_jobs(
                 live_jobs, live_source, finished_jobs, finished_source
             )

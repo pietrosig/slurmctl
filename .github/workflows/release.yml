@@ -16,13 +16,15 @@ jobs:
 
       - name: Build release asset
         run: |
-          cp slurmctl.py slurmctl
-          chmod +x slurmctl
+          mkdir -p dist
+          cp slurmctl.py dist/slurmctl
+          chmod +x dist/slurmctl
+          test -f dist/slurmctl
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v2
         with:
-          files: slurmctl
+          files: dist/slurmctl
           prerelease: false
           draft: false
           make_latest: true

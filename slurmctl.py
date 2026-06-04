@@ -1352,6 +1352,8 @@ class InteractiveShell:
         self.search_active = False
         self.watch_visual_anchor: int | None = None
         self.active_watch_records: list[dict] = []
+        self.panel_cursors: dict[str, tuple[int, int]] = {}
+        self.panel_cursor_keys: dict[str, str] = {}
         self.reset_selection()
         self.message = ""
         self.dirty = True
@@ -1713,6 +1715,36 @@ class InteractiveShell:
         self.selected = 0
         self.scroll_top = 0
         self.clear_watch_visual()
+
+    def save_panel_cursor(self, view: str | None = None) -> None:
+        panel = view or self.view
+        self.panel_cursors[panel] = (self.selected, self.scroll_top)
+        if panel == "watch":
+            items = self.filtered_watch_jobs()
+            if 0 <= self.selected < len(items):
+                item = items[self.selected]
+                if not is_watch_load_more_item(item):
+                    key = f"{item.get('source') or ''}:{item.get('job_id') or ''}"
+                    self.panel_cursor_keys[panel] = key
+
+    def restore_panel_cursor(self, view: str, *, reset: bool = False) -> None:
+        if reset:
+            self.panel_cursors[view] = (0, 0)
+        self.selected, self.scroll_top = self.panel_cursors.get(view, (0, 0))
+        if view == "watch" and not reset:
+            key = self.panel_cursor_keys.get(view)
+            if key:
+                for idx, item in enumerate(self.filtered_watch_jobs()):
+                    item_key = f"{item.get('source') or ''}:{item.get('job_id') or ''}"
+                    if item_key == key:
+                        self.selected = idx
+                        break
+        self.clear_watch_visual()
+
+    def switch_view(self, view: str, *, reset_cursor: bool = False) -> None:
+        self.save_panel_cursor()
+        self.view = view
+        self.restore_panel_cursor(view, reset=reset_cursor)
 
     def prepare_view(self, view: str) -> None:
         if view == "run":
@@ -2356,26 +2388,28 @@ class InteractiveShell:
     def go_back(self) -> None:
         if self.view == "home":
             return
+        target_view = "home"
         if self.view in {"run", "show", "watch"}:
-            self.view = "home"
+            target_view = "home"
         elif self.view == "actions":
-            self.view = "show"
+            target_view = "show"
         elif self.view == "watch_actions":
-            self.view = "watch"
+            target_view = "watch"
         elif self.view == "watch_multi_actions":
-            self.view = "watch"
+            target_view = "watch"
             self.active_watch_records = []
         elif self.view == "confirm":
             self.cancel_confirm()
+            return
         elif self.view == "viewer":
-            self.view = "actions"
+            target_view = "actions"
         elif self.view == "settings":
-            self.view = "home"
+            target_view = "home"
             self.editing_setting = None
             self.pending_slurmctl_dir = None
+        self.switch_view(target_view)
         self.query = ""
         self.search_active = False
-        self.reset_selection()
         self.message = ""
 
     def activate(self) -> None:
@@ -2389,11 +2423,10 @@ class InteractiveShell:
             items = self.filtered_home()
             if not items:
                 return
-            self.view = items[self.selected]["name"]
+            self.switch_view(items[self.selected]["name"])
             self.prepare_view(self.view)
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             self.message = ""
             return
         if self.view == "run":
@@ -2404,10 +2437,9 @@ class InteractiveShell:
             if not items:
                 return
             self.active_record = items[self.selected]
-            self.view = "actions"
+            self.switch_view("actions")
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             return
         if self.view == "watch":
             if self.watch_visual_active():
@@ -2420,10 +2452,9 @@ class InteractiveShell:
             if is_watch_load_more_item(self.active_job):
                 self.load_more_finished_jobs()
                 return
-            self.view = "watch_actions"
+            self.switch_view("watch_actions")
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             return
         if self.view == "actions":
             items = self.action_items()
@@ -2446,10 +2477,9 @@ class InteractiveShell:
                 self.perform_confirm(items[self.selected]["key"])
             return
         if self.view == "viewer":
-            self.view = "actions"
+            self.switch_view("actions")
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             return
         if self.view == "settings":
             items = self.settings_items()
@@ -2498,10 +2528,9 @@ class InteractiveShell:
             self.message = "No jobs selected."
             return
         self.active_watch_records = list(jobs)
-        self.view = "watch_multi_actions"
+        self.switch_view("watch_multi_actions")
         self.query = ""
         self.search_active = False
-        self.reset_selection()
 
     def load_more_finished_jobs(self) -> None:
         self.watch_finished_hours += self.watch_finished_hours_step
@@ -2517,18 +2546,16 @@ class InteractiveShell:
         if not record:
             return
         if key == "B":
-            self.view = "show"
+            self.switch_view("show")
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             return
         if key == "D":
             delete_submission(record, self.args.slurmctl_dir)
             self.refresh_submissions_cache()
-            self.view = "show"
+            self.switch_view("show")
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             self.message = f"Deleted run {record.get('run_id') or ''}".strip()
             return
         if key == "R":
@@ -2552,10 +2579,9 @@ class InteractiveShell:
         if not job:
             return
         if key == "B":
-            self.view = "watch"
+            self.switch_view("watch")
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             return
         submission = job.get("submission") or self.find_submission_for_job(
             job.get("job_id")
@@ -2595,11 +2621,10 @@ class InteractiveShell:
 
     def perform_watch_multi_action(self, key: str) -> None:
         if key == "B":
-            self.view = "watch"
+            self.switch_view("watch")
             self.active_watch_records = []
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             return
         if key == "C":
             self.begin_cancel_jobs(self.active_watch_records)
@@ -2685,20 +2710,18 @@ class InteractiveShell:
         self.confirm_message = message
         self.confirm_return_view = return_view
         self.confirm_success_view = success_view
-        self.view = "confirm"
+        self.switch_view("confirm", reset_cursor=True)
         self.query = ""
         self.search_active = False
-        self.reset_selection()
 
     def cancel_confirm(self) -> None:
         return_view = self.confirm_return_view
         self.confirm_kind = ""
         self.confirm_message = ""
         self.confirm_payload = []
-        self.view = return_view
+        self.switch_view(return_view)
         self.query = ""
         self.search_active = False
-        self.reset_selection()
         self.message = "Action cancelled."
 
     def perform_confirm(self, key: str) -> None:
@@ -2746,8 +2769,7 @@ class InteractiveShell:
         self.active_watch_records = []
         self.query = ""
         self.search_active = False
-        self.view = success_view
-        self.reset_selection()
+        self.switch_view(success_view)
         self.schedule_watch_refresh()
 
     def find_submission_for_job(self, job_id: object) -> dict | None:
@@ -2809,7 +2831,6 @@ class InteractiveShell:
             self.message = f"Editor exited with {code}: {resolved}"
             self.query = ""
             self.search_active = False
-            self.reset_selection()
         finally:
             curses.reset_prog_mode()
             self.screen.keypad(True)
@@ -2842,7 +2863,6 @@ class InteractiveShell:
         self.editing_setting = None
         self.query = ""
         self.search_active = False
-        self.reset_selection()
         self.message = f"Saved {key} in {config_path()}"
 
     def finish_slurmctl_dir_change(self) -> None:
@@ -2872,7 +2892,6 @@ class InteractiveShell:
         self.pending_slurmctl_dir = None
         self.query = ""
         self.search_active = False
-        self.reset_selection()
         moved = "moved data and " if answer == "MOVE" else ""
         self.message = f"{moved}saved slurmctl_dir in {config_path()}"
 
@@ -2916,10 +2935,9 @@ class InteractiveShell:
             self.refresh_submissions_cache()
             if return_view == "watch":
                 self.schedule_watch_refresh()
-            self.view = return_view
+            self.switch_view(return_view)
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             self.message = f"Reran {record.get('script_path') or 'submission'}"
         finally:
             curses.reset_prog_mode()
@@ -2978,11 +2996,10 @@ class InteractiveShell:
             )
             self.refresh_submissions_cache()
             self.schedule_watch_refresh()
-            self.view = success_view
+            self.switch_view(success_view)
             self.active_watch_records = []
             self.query = ""
             self.search_active = False
-            self.reset_selection()
             suffix = " without dependencies" if remove_dependency else ""
             self.message = (
                 f"Reran {len(results)} selected jobs{suffix}; {failed} failed."

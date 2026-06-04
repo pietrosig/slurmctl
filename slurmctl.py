@@ -1,13 +1,5 @@
 #!/bin/sh
-""":'
-for py in "${SLURMCTL_PYTHON:-}" python3.13 python3.12 python3.11 python3; do
-    [ -n "$py" ] || continue
-    "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || continue
-    exec "$py" "$0" "$@"
-done
-echo "slurmctl: Python 3.11+ is required" >&2
-exit 127
-':"""
+''''exec sh -c 'script=$1; shift; for py in "${SLURMCTL_PYTHON:-}" python3.13 python3.12 python3.11 python3; do [ -n "$py" ] || continue; "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || continue; exec "$py" "$script" "$@"; done; echo "slurmctl: Python 3.11+ is required" >&2; exit 127' sh "$0" "$@" # '''
 
 from __future__ import annotations
 
@@ -33,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 GITHUB_REPO = "pietrosig/slurmctl"
 RELEASE_ASSET_NAME = "slurmctl"
 LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -737,14 +729,7 @@ def make_wrapper(wrapper_dir: Path) -> Path:
     python = sys.executable or shutil.which("python3") or "python3"
     launcher = (
         """#!/bin/sh
-''':'
-py="${SLURMCTL_PYTHON:-%s}"
-"$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || {
-    echo "slurmctl sbatch wrapper: Python 3.11+ is required" >&2
-    exit 127
-}
-exec "$py" "$0" "$@"
-':'''
+''''exec sh -c 'script=$1; shift; py="${SLURMCTL_PYTHON:-%s}"; "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || { echo "slurmctl sbatch wrapper: Python 3.11+ is required" >&2; exit 127; }; exec "$py" "$script" "$@"' sh "$0" "$@" # '''
 """
         % python
     )

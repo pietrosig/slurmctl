@@ -1,5 +1,5 @@
 #!/bin/sh
-''':'
+""":'
 for py in "${SLURMCTL_PYTHON:-}" python3.13 python3.12 python3.11 python3; do
     [ -n "$py" ] || continue
     "$py" -c "import sys; raise SystemExit(sys.version_info < (3, 11))" >/dev/null 2>&1 || continue
@@ -7,7 +7,7 @@ for py in "${SLURMCTL_PYTHON:-}" python3.13 python3.12 python3.11 python3; do
 done
 echo "slurmctl: Python 3.11+ is required" >&2
 exit 127
-':'''
+':"""
 
 from __future__ import annotations
 
@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 GITHUB_REPO = "pietrosig/slurmctl"
 RELEASE_ASSET_NAME = "slurmctl"
 LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -507,7 +507,7 @@ def load_settings() -> dict:
         return settings
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
+    except OSError, json.JSONDecodeError:
         return settings
     if isinstance(loaded, dict):
         settings.update(
@@ -603,20 +603,17 @@ def default_sbatch_wrapper_path() -> Path:
 
 def path_entries(path_text: str | None = None) -> list[Path]:
     source = path_text if path_text is not None else os.environ.get("PATH", "")
-    return [
-        Path(item).expanduser()
-        for item in source.split(os.pathsep)
-        if item
-    ]
+    return [Path(item).expanduser() for item in source.split(os.pathsep) if item]
 
 
 def is_managed_sbatch_wrapper(path: Path) -> bool:
     try:
         if not path.is_file():
             return False
-        return SBATCH_WRAPPER_MARKER in path.read_text(
-            encoding="utf-8", errors="replace"
-        )[:4096]
+        return (
+            SBATCH_WRAPPER_MARKER
+            in path.read_text(encoding="utf-8", errors="replace")[:4096]
+        )
     except OSError:
         return False
 
@@ -658,9 +655,7 @@ def sbatch_wrapper_status() -> dict:
     conflict = wrapper_path.exists() and not installed
     path_sbatch = discover_path_sbatch()
     active = bool(
-        installed
-        and path_sbatch
-        and same_path(Path(path_sbatch), wrapper_path)
+        installed and path_sbatch and same_path(Path(path_sbatch), wrapper_path)
     )
     real_sbatch = discover_real_sbatch(skip_paths={wrapper_path})
     return {
@@ -988,7 +983,9 @@ def resolved_record_script_path(record: dict) -> Path | None:
     return path
 
 
-def dependency_free_script_copy(record: dict, temp_dir: Path) -> tuple[Path | None, str]:
+def dependency_free_script_copy(
+    record: dict, temp_dir: Path
+) -> tuple[Path | None, str]:
     source = resolved_record_script_path(record)
     if source is None:
         return None, ""
@@ -2044,7 +2041,9 @@ class InteractiveShell:
                 for item in self.filtered_watch_jobs()
                 if not is_watch_load_more_item(item)
             )
-            context = f"{shown} shown / {len(self.watch_cache)} total | {self.watch_source}"
+            context = (
+                f"{shown} shown / {len(self.watch_cache)} total | {self.watch_source}"
+            )
             if self.watch_refreshing:
                 context += " | refreshing"
             if self.watch_error:
@@ -2279,7 +2278,11 @@ class InteractiveShell:
         if self.confirm_kind == "rerun_dependency":
             return [
                 {"key": "E", "name": "exact", "detail": "Keep dependency options"},
-                {"key": "D", "name": "no dependency", "detail": "Remove dependency options"},
+                {
+                    "key": "D",
+                    "name": "no dependency",
+                    "detail": "Remove dependency options",
+                },
                 {"key": "B", "name": "back", "detail": "Return without rerunning"},
             ]
         return [
@@ -2456,9 +2459,7 @@ class InteractiveShell:
             rows.append(f"{'script':<10} {submission.get('script_path') or '-'}")
         return title, rows
 
-    def draw_watch_job_details(
-        self, y: int, x: int, width: int, job: dict
-    ) -> int:
+    def draw_watch_job_details(self, y: int, x: int, width: int, job: dict) -> int:
         title, rows = self.watch_job_detail_rows(job)
         box_width = max(20, width - x - 1)
         inner_width = max(0, box_width - 2)
@@ -2895,7 +2896,9 @@ class InteractiveShell:
             self.message = f"Deleted run {record.get('run_id') or ''}".strip()
             return
         if key == "R":
-            self.begin_rerun_records([record], return_view="actions", success_view="show")
+            self.begin_rerun_records(
+                [record], return_view="actions", success_view="show"
+            )
             return
         if key == "OO":
             self.open_record_path_in_editor(record, "resolved_stdout_path")
@@ -3327,8 +3330,7 @@ class InteractiveShell:
                     results.append((record, code))
             failed = sum(1 for _record, code in results if code != 0)
             input(
-                f"\nreran {len(results)} jobs; {failed} failed. "
-                "Press Enter to return."
+                f"\nreran {len(results)} jobs; {failed} failed. Press Enter to return."
             )
             self.refresh_submissions_cache()
             self.schedule_watch_refresh()
@@ -3358,7 +3360,9 @@ def doctor(args: argparse.Namespace) -> int:
     if wrapper["conflict"]:
         wrapper_state = "conflict"
     elif wrapper["installed"]:
-        wrapper_state = "active" if wrapper["active"] else "installed but not first on PATH"
+        wrapper_state = (
+            "active" if wrapper["active"] else "installed but not first on PATH"
+        )
     else:
         wrapper_state = "not installed"
     print(f"sbatch wrapper: {wrapper_state}")
@@ -3505,7 +3509,10 @@ def update(args: argparse.Namespace) -> int:
     current_version = parse_version(__version__)
     latest_version = parse_version(latest_tag)
     if latest_version is None:
-        print(f"slurmctl: latest release tag is not semver-like: {latest_tag}", file=sys.stderr)
+        print(
+            f"slurmctl: latest release tag is not semver-like: {latest_tag}",
+            file=sys.stderr,
+        )
         return 1
 
     print(f"current: {__version__}")
@@ -3516,7 +3523,11 @@ def update(args: argparse.Namespace) -> int:
             return 1
         print("slurmctl is already up to date")
         return 0
-    if current_version is not None and latest_version <= current_version and not args.force:
+    if (
+        current_version is not None
+        and latest_version <= current_version
+        and not args.force
+    ):
         print("slurmctl is already up to date")
         return 0
 
@@ -3542,7 +3553,10 @@ def update(args: argparse.Namespace) -> int:
         )
         if not ok:
             tmp_path.unlink(missing_ok=True)
-            print(f"slurmctl: downloaded update failed validation: {reason}", file=sys.stderr)
+            print(
+                f"slurmctl: downloaded update failed validation: {reason}",
+                file=sys.stderr,
+            )
             return 1
         os.replace(tmp_path, target)
     except (OSError, urllib.error.URLError, subprocess.SubprocessError) as exc:

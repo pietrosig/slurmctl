@@ -14,6 +14,15 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - name: Check version matches tag
+        run: |
+          version="$(python3 slurmctl.py --version | awk '{print $2}')"
+          tag="${GITHUB_REF_NAME#v}"
+          if [ "$version" != "$tag" ]; then
+            echo "__version__ ($version) does not match tag ($tag)" >&2
+            exit 1
+          fi
+
       - name: Build release asset
         run: |
           mkdir -p dist

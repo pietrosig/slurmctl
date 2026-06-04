@@ -33,7 +33,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-__version__ = "0.1.0"
+__version__ = "0.1.3"
 GITHUB_REPO = "pietrosig/slurmctl"
 RELEASE_ASSET_NAME = "slurmctl"
 LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -3140,7 +3140,9 @@ def current_executable_path() -> Path:
     return Path(found or raw).resolve()
 
 
-def validate_downloaded_executable(path: Path) -> tuple[bool, str]:
+def validate_downloaded_executable(
+    path: Path, *, expected_version: str | None = None
+) -> tuple[bool, str]:
     try:
         data = path.read_bytes()
     except OSError as exc:
@@ -3156,6 +3158,25 @@ def validate_downloaded_executable(path: Path) -> tuple[bool, str]:
     if proc.returncode != 0:
         output = (proc.stdout + proc.stderr).strip()
         return False, output or f"validation exited {proc.returncode}"
+    if expected_version is not None:
+        version_proc = subprocess.run(
+            [sys.executable, str(path), "--version"],
+            text=True,
+            capture_output=True,
+            timeout=10,
+        )
+        if version_proc.returncode != 0:
+            output = (version_proc.stdout + version_proc.stderr).strip()
+            return False, output or "version validation failed"
+        downloaded_version = version_proc.stdout.strip().split()[-1]
+        if parse_version(downloaded_version) != parse_version(expected_version):
+            return (
+                False,
+                (
+                    f"downloaded version {downloaded_version} does not match "
+                    f"release {expected_version}"
+                ),
+            )
     return True, ""
 
 
@@ -3222,7 +3243,9 @@ def update(args: argparse.Namespace) -> int:
     try:
         data = read_url(asset_url)
         tmp_path = write_update_candidate(target, data)
-        ok, reason = validate_downloaded_executable(tmp_path)
+        ok, reason = validate_downloaded_executable(
+            tmp_path, expected_version=latest_tag
+        )
         if not ok:
             tmp_path.unlink(missing_ok=True)
             print(f"slurmctl: downloaded update failed validation: {reason}", file=sys.stderr)

@@ -507,7 +507,7 @@ def load_settings() -> dict:
         return settings
     try:
         loaded = json.loads(path.read_text(encoding="utf-8"))
-    except OSError, json.JSONDecodeError:
+    except (OSError, json.JSONDecodeError):
         return settings
     if isinstance(loaded, dict):
         settings.update(

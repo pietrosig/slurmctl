@@ -16,8 +16,13 @@ jobs:
 
       - name: Check version matches tag
         run: |
+          python3 -m py_compile slurmctl.py
           version="$(python3 slurmctl.py --version | awk '{print $2}')"
           tag="${GITHUB_REF_NAME#v}"
+          if [ -z "$version" ]; then
+            echo "could not read __version__ from slurmctl.py" >&2
+            exit 1
+          fi
           if [ "$version" != "$tag" ]; then
             echo "__version__ ($version) does not match tag ($tag)" >&2
             exit 1

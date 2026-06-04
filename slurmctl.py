@@ -40,6 +40,7 @@ LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/l
 LATEST_RELEASE_ASSET_URL = (
     f"https://github.com/{GITHUB_REPO}/releases/latest/download/{RELEASE_ASSET_NAME}"
 )
+SBATCH_WRAPPER_MARKER = "# slurmctl managed sbatch wrapper"
 
 
 WRAPPER_CODE = r"""from __future__ import annotations
@@ -414,7 +415,7 @@ if __name__ == "__main__":
 
 DEFAULT_SETTINGS = {
     "editor": "",
-    "slurmctl_dir": ".slurmctl",
+    "slurmctl_dir": str(Path.home() / ".slurmctl"),
 }
 
 RUNNING_STATES = {
@@ -596,8 +597,144 @@ def build_parser() -> argparse.ArgumentParser:
     return parser
 
 
-def discover_real_sbatch() -> str | None:
+def default_sbatch_wrapper_path() -> Path:
+    return Path.home() / ".local" / "bin" / "sbatch"
+
+
+def path_entries(path_text: str | None = None) -> list[Path]:
+    source = path_text if path_text is not None else os.environ.get("PATH", "")
+    return [
+        Path(item).expanduser()
+        for item in source.split(os.pathsep)
+        if item
+    ]
+
+
+def is_managed_sbatch_wrapper(path: Path) -> bool:
+    try:
+        if not path.is_file():
+            return False
+        return SBATCH_WRAPPER_MARKER in path.read_text(
+            encoding="utf-8", errors="replace"
+        )[:4096]
+    except OSError:
+        return False
+
+
+def same_path(left: Path, right: Path) -> bool:
+    try:
+        return left.resolve() == right.resolve()
+    except OSError:
+        return left == right
+
+
+def discover_path_sbatch() -> str | None:
     return shutil.which("sbatch", path=os.environ.get("PATH", ""))
+
+
+def discover_real_sbatch(skip_paths: set[Path] | None = None) -> str | None:
+    env_real = os.environ.get("SLURMCTL_REAL_SBATCH")
+    if env_real:
+        candidate = Path(env_real).expanduser()
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+
+    skip_paths = skip_paths or set()
+    for directory in path_entries():
+        candidate = directory / "sbatch"
+        if not candidate.is_file() or not os.access(candidate, os.X_OK):
+            continue
+        if any(same_path(candidate, skipped) for skipped in skip_paths):
+            continue
+        if is_managed_sbatch_wrapper(candidate):
+            continue
+        return str(candidate.resolve())
+    return None
+
+
+def sbatch_wrapper_status() -> dict:
+    wrapper_path = default_sbatch_wrapper_path()
+    installed = is_managed_sbatch_wrapper(wrapper_path)
+    conflict = wrapper_path.exists() and not installed
+    path_sbatch = discover_path_sbatch()
+    active = bool(
+        installed
+        and path_sbatch
+        and same_path(Path(path_sbatch), wrapper_path)
+    )
+    real_sbatch = discover_real_sbatch(skip_paths={wrapper_path})
+    return {
+        "path": wrapper_path,
+        "installed": installed,
+        "conflict": conflict,
+        "active": active,
+        "path_sbatch": path_sbatch,
+        "real_sbatch": real_sbatch,
+    }
+
+
+def discover_slurmctl_command() -> str | None:
+    command = shutil.which("slurmctl")
+    if command:
+        return str(Path(command).resolve())
+    current = Path(sys.argv[0]).expanduser()
+    if current.exists() and os.access(current, os.X_OK):
+        return str(current.resolve())
+    return None
+
+
+def sbatch_wrapper_script(real_sbatch: str, slurmctl_command: str) -> str:
+    return f"""#!/bin/sh
+{SBATCH_WRAPPER_MARKER}
+SLURMCTL_REAL_SBATCH={shlex.quote(real_sbatch)}
+export SLURMCTL_REAL_SBATCH
+exec {shlex.quote(slurmctl_command)} sbatch "$@"
+"""
+
+
+def install_sbatch_wrapper() -> tuple[int, str]:
+    status = sbatch_wrapper_status()
+    wrapper_path: Path = status["path"]
+    if status["conflict"]:
+        return (
+            2,
+            f"Refusing to overwrite existing non-slurmctl sbatch at {wrapper_path}",
+        )
+    real_sbatch = status["real_sbatch"]
+    if not real_sbatch:
+        return 127, "Real sbatch not found on PATH."
+    slurmctl_command = discover_slurmctl_command()
+    if not slurmctl_command:
+        return 127, "slurmctl executable not found; install slurmctl on PATH first."
+
+    wrapper_path.parent.mkdir(parents=True, exist_ok=True)
+    wrapper_path.write_text(
+        sbatch_wrapper_script(real_sbatch, slurmctl_command), encoding="utf-8"
+    )
+    mode = wrapper_path.stat().st_mode
+    wrapper_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+
+    refreshed = sbatch_wrapper_status()
+    if refreshed["active"]:
+        return 0, f"Installed sbatch wrapper at {wrapper_path}"
+    return (
+        0,
+        f"Installed sbatch wrapper at {wrapper_path}; put {wrapper_path.parent} first on PATH.",
+    )
+
+
+def uninstall_sbatch_wrapper() -> tuple[int, str]:
+    status = sbatch_wrapper_status()
+    wrapper_path: Path = status["path"]
+    if status["conflict"]:
+        return (
+            2,
+            f"Refusing to remove non-slurmctl sbatch at {wrapper_path}",
+        )
+    if not status["installed"]:
+        return 0, "No slurmctl sbatch wrapper is installed."
+    wrapper_path.unlink()
+    return 0, f"Removed sbatch wrapper at {wrapper_path}"
 
 
 def make_wrapper(wrapper_dir: Path) -> Path:
@@ -1374,6 +1511,7 @@ class InteractiveShell:
         self.confirm_payload: list[dict] = []
         self.confirm_return_view = "watch"
         self.confirm_success_view = "watch"
+        self.sbatch_wrapper_return_view = "settings"
         self.pending_slurmctl_dir: str | None = None
         self.screen: curses.window | None = None
         self.view = "home"
@@ -1412,6 +1550,11 @@ class InteractiveShell:
             {"name": "run", "detail": "Run a script with sbatch interception"},
             {"name": "show", "detail": "Browse captured submissions"},
             {"name": "watch", "detail": "Watch current Slurm jobs"},
+            {
+                "name": "install sbatch",
+                "view": "sbatch_wrapper",
+                "detail": "Optional plain sbatch capture wrapper",
+            },
             {"name": "settings", "detail": "Choose editor and metadata directory"},
         ]
 
@@ -1832,6 +1975,8 @@ class InteractiveShell:
             self.draw_viewer(height, width)
         elif self.view == "settings":
             self.draw_settings(height, width)
+        elif self.view == "sbatch_wrapper":
+            self.draw_sbatch_wrapper(height, width)
 
         if height > 2:
             status = self.status_line()
@@ -1847,6 +1992,7 @@ class InteractiveShell:
             "confirm": "Confirm",
             "viewer": "Search text",
             "settings": "Search/edit settings",
+            "sbatch_wrapper": "Search actions",
         }.get(self.view, "Search")
         marker = "*" if self.search_active else " "
         self.add(
@@ -1862,6 +2008,8 @@ class InteractiveShell:
             if self.confirm_kind == "rerun_dependency":
                 return "Enter select | E exact | D no dependency | B back"
             return "Enter select | Y yes | F false | B back"
+        if self.view == "sbatch_wrapper":
+            return self.message or "Enter select | I install | U uninstall | B back"
         if self.watch_visual_active():
             if self.message:
                 return self.message
@@ -1886,6 +2034,7 @@ class InteractiveShell:
             "confirm": "Confirm",
             "viewer": "Viewer",
             "settings": "Settings",
+            "sbatch_wrapper": "Install sbatch",
         }.get(self.view, self.view.title())
         if self.view == "show":
             context = f"{len(self.filtered_submissions())} shown / {len(self.submissions_cache)} total"
@@ -1914,6 +2063,15 @@ class InteractiveShell:
             context = self.confirm_kind or "confirm"
         elif self.view == "settings":
             context = str(config_path())
+        elif self.view == "sbatch_wrapper":
+            status = sbatch_wrapper_status()
+            if status["conflict"]:
+                state = "conflict"
+            elif status["installed"]:
+                state = "active" if status["active"] else "installed"
+            else:
+                state = "not installed"
+            context = f"{state} | real {status['real_sbatch'] or 'not found'}"
         else:
             context = str(Path.cwd())
         line = f" slurmctl  >  {view_title}  |  {context}"
@@ -1930,7 +2088,7 @@ class InteractiveShell:
                 curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             )
             self.add(
-                idx + 2, 2, f"{item['name']:<8} {item['detail']}"[: width - 4], attr
+                idx + 2, 2, f"{item['name']:<15} {item['detail']}"[: width - 4], attr
             )
 
     def draw_run(self, height: int, width: int) -> None:
@@ -2130,6 +2288,13 @@ class InteractiveShell:
         ]
 
     def settings_items(self) -> list[dict]:
+        wrapper_status = sbatch_wrapper_status()
+        if wrapper_status["conflict"]:
+            wrapper_value = "conflict"
+        elif wrapper_status["installed"]:
+            wrapper_value = "active" if wrapper_status["active"] else "installed"
+        else:
+            wrapper_value = "not installed"
         items = [
             {
                 "key": "editor",
@@ -2141,8 +2306,15 @@ class InteractiveShell:
             {
                 "key": "slurmctl_dir",
                 "name": ".slurmctl dir",
-                "value": self.settings.get("slurmctl_dir") or ".slurmctl",
+                "value": self.settings.get("slurmctl_dir")
+                or DEFAULT_SETTINGS["slurmctl_dir"],
                 "detail": "Default metadata directory",
+            },
+            {
+                "key": "sbatch_wrapper",
+                "name": "sbatch wrapper",
+                "value": wrapper_value,
+                "detail": "Install/uninstall optional plain sbatch capture",
             },
         ]
         if self.editing_setting:
@@ -2169,6 +2341,73 @@ class InteractiveShell:
             )
             row = f"{item['name']:<18} {item['value']:<32} {item['detail']}"
             self.add(idx + 4, 2, row[: width - 4], attr)
+
+    def sbatch_wrapper_items(self) -> list[dict]:
+        actions = [
+            {
+                "key": "I",
+                "name": "install",
+                "detail": "Create ~/.local/bin/sbatch managed by slurmctl",
+            },
+            {
+                "key": "U",
+                "name": "uninstall",
+                "detail": "Remove the managed sbatch wrapper",
+            },
+            {
+                "key": "B",
+                "name": "back",
+                "detail": f"Return to {self.sbatch_wrapper_return_view}",
+            },
+        ]
+        return self.filter_items(
+            actions, lambda item: f"{item['key']} {item['name']} {item['detail']}"
+        )
+
+    def draw_sbatch_wrapper(self, height: int, width: int) -> None:
+        status = sbatch_wrapper_status()
+        if status["conflict"]:
+            installed = "conflict: file exists but is not managed by slurmctl"
+        elif status["installed"]:
+            installed = "yes"
+        else:
+            installed = "no"
+        active = "yes" if status["active"] else "no"
+        lines = [
+            "Optional wrapper for plain sbatch capture.",
+            "With this installed, scripts that call sbatch behave like slurmctl sbatch.",
+            f"managed path: {status['path']}",
+            f"installed:    {installed}",
+            f"active PATH:  {active}",
+            f"real sbatch:  {status['real_sbatch'] or 'not found'}",
+            f"PATH sbatch:  {status['path_sbatch'] or 'not found'}",
+        ]
+        if status["installed"] and not status["active"]:
+            lines.append(
+                f"hint: put {status['path'].parent} before the real sbatch directory on PATH"
+            )
+        lines.append("Uninstall only removes a file containing the slurmctl marker.")
+        for idx, line in enumerate(lines):
+            attr = curses.A_BOLD if idx == 0 else curses.A_NORMAL
+            self.add(2 + idx, 2, line[: width - 4], attr)
+
+        action_row = 2 + len(lines) + 1
+        items = self.sbatch_wrapper_items()
+        self.clamp_selected(len(items))
+        start, visible = self.visible_slice(
+            items, self.content_rows(height, action_row)
+        )
+        for idx, item in enumerate(visible):
+            absolute_idx = start + idx
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
+            self.add(
+                action_row + idx,
+                2,
+                f"{item['key']:<5} {item['name']:<14} {item['detail']}"[: width - 4],
+                attr,
+            )
 
     def draw_actions(self, height: int, width: int) -> None:
         record = getattr(self, "active_record", None) or {}
@@ -2431,6 +2670,8 @@ class InteractiveShell:
                 self.maybe_activate_watch_shortcut(char)
             elif self.view == "watch_multi_actions":
                 self.maybe_activate_watch_multi_shortcut(char)
+            elif self.view == "sbatch_wrapper":
+                self.maybe_activate_sbatch_wrapper_shortcut(char)
             elif self.view == "confirm":
                 self.perform_confirm(char.upper())
             else:
@@ -2459,6 +2700,8 @@ class InteractiveShell:
             target_view = "home"
             self.editing_setting = None
             self.pending_slurmctl_dir = None
+        elif self.view == "sbatch_wrapper":
+            target_view = self.sbatch_wrapper_return_view
         self.switch_view(target_view)
         self.query = ""
         self.search_active = False
@@ -2475,7 +2718,10 @@ class InteractiveShell:
             items = self.filtered_home()
             if not items:
                 return
-            self.switch_view(items[self.selected]["name"])
+            next_view = items[self.selected].get("view", items[self.selected]["name"])
+            if next_view == "sbatch_wrapper":
+                self.sbatch_wrapper_return_view = "home"
+            self.switch_view(next_view)
             self.prepare_view(self.view)
             self.query = ""
             self.search_active = False
@@ -2538,11 +2784,23 @@ class InteractiveShell:
             if not items:
                 return
             item = items[self.selected]
+            if item["key"] == "sbatch_wrapper":
+                self.sbatch_wrapper_return_view = "settings"
+                self.switch_view("sbatch_wrapper")
+                self.query = ""
+                self.search_active = False
+                self.message = ""
+                return
             self.editing_setting = item["key"]
             raw_value = self.settings.get(item["key"], "")
             self.query = raw_value
             self.search_active = True
             self.message = f"Editing {item['name']}; Enter saves."
+            return
+        if self.view == "sbatch_wrapper":
+            items = self.sbatch_wrapper_items()
+            if items:
+                self.perform_sbatch_wrapper_action(items[self.selected]["key"])
 
     def activate_run(self) -> None:
         items = self.filtered_scripts()
@@ -2575,6 +2833,13 @@ class InteractiveShell:
         if upper in keys:
             self.perform_watch_multi_action(upper)
 
+    def maybe_activate_sbatch_wrapper_shortcut(self, char: str) -> None:
+        self.query += char
+        upper = self.query.upper()
+        keys = {item["key"] for item in self.sbatch_wrapper_items()}
+        if upper in keys:
+            self.perform_sbatch_wrapper_action(upper)
+
     def open_watch_multi_actions(self, jobs: list[dict]) -> None:
         if not jobs:
             self.message = "No jobs selected."
@@ -2592,6 +2857,25 @@ class InteractiveShell:
             )
         else:
             self.watch_finished_hours -= self.watch_finished_hours_step
+
+    def perform_sbatch_wrapper_action(self, key: str) -> None:
+        if key == "B":
+            self.switch_view(self.sbatch_wrapper_return_view)
+            self.query = ""
+            self.search_active = False
+            return
+        if key == "I":
+            code, message = install_sbatch_wrapper()
+            self.message = message if code == 0 else f"Install failed: {message}"
+            self.query = ""
+            self.search_active = False
+            return
+        if key == "U":
+            code, message = uninstall_sbatch_wrapper()
+            self.message = message if code == 0 else f"Uninstall failed: {message}"
+            self.query = ""
+            self.search_active = False
+            return
 
     def perform_action(self, key: str) -> None:
         record = getattr(self, "active_record", None)
@@ -2894,7 +3178,7 @@ class InteractiveShell:
             return
         value = self.query.strip()
         if key == "slurmctl_dir" and not value:
-            value = ".slurmctl"
+            value = DEFAULT_SETTINGS["slurmctl_dir"]
         if key == "slurmctl_dir":
             old_value = self.args.slurmctl_dir
             old_dir = resolve_from_cwd(old_value)
@@ -3064,10 +3348,20 @@ class InteractiveShell:
 
 def doctor(args: argparse.Namespace) -> int:
     real_sbatch = discover_real_sbatch()
+    wrapper = sbatch_wrapper_status()
     settings = load_settings()
     print(f"PATH: {os.environ.get('PATH', '')}")
     print(f"python: {sys.executable}")
     print(f"sbatch: {real_sbatch or 'not found'}")
+    print(f"PATH sbatch: {wrapper['path_sbatch'] or 'not found'}")
+    print(f"sbatch wrapper path: {wrapper['path']}")
+    if wrapper["conflict"]:
+        wrapper_state = "conflict"
+    elif wrapper["installed"]:
+        wrapper_state = "active" if wrapper["active"] else "installed but not first on PATH"
+    else:
+        wrapper_state = "not installed"
+    print(f"sbatch wrapper: {wrapper_state}")
     print(f"squeue: {shutil.which('squeue') or 'not found'}")
     print(f"sacct: {shutil.which('sacct') or 'not found'}")
     print(f"scancel: {shutil.which('scancel') or 'not found'}")

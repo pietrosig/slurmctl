@@ -19,11 +19,17 @@ It works by putting a temporary fake `sbatch` at the front of `PATH`. The fake
 
 ## Install
 
-Single-file install:
+Recommended install:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/pietrosig/slurmctl/main/install.sh | sh
+```
+
+Manual single-file install:
 
 ```bash
 mkdir -p ~/.local/bin
-curl -fsSL https://raw.githubusercontent.com/pietrosig/slurmctl/main/slurmctl.py -o ~/.local/bin/slurmctl
+curl -fsSL https://github.com/pietrosig/slurmctl/releases/latest/download/slurmctl -o ~/.local/bin/slurmctl
 chmod +x ~/.local/bin/slurmctl
 ```
 
@@ -37,12 +43,31 @@ Make sure `~/.local/bin` is on your `PATH`:
 export PATH="$HOME/.local/bin:$PATH"
 ```
 
+Update an installed release:
+
+```bash
+slurmctl update
+```
+
+Check for an update without changing the installed executable:
+
+```bash
+slurmctl update --check
+```
+
 For local development from this repo:
 
 ```bash
 chmod +x slurmctl.py
 ./slurmctl.py doctor
 ```
+
+## Release
+
+`slurmctl update` installs the latest GitHub Release asset named `slurmctl`.
+
+The release workflow copies `slurmctl.py` to an executable asset named
+`slurmctl` and attaches it to the GitHub Release.
 
 ## Quick Start
 

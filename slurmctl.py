@@ -27,8 +27,19 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.error
+import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
+
+
+__version__ = "0.1.0"
+GITHUB_REPO = "pietrosig/slurmctl"
+RELEASE_ASSET_NAME = "slurmctl"
+LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+LATEST_RELEASE_ASSET_URL = (
+    f"https://github.com/{GITHUB_REPO}/releases/latest/download/{RELEASE_ASSET_NAME}"
+)
 
 
 WRAPPER_CODE = r"""from __future__ import annotations
@@ -547,6 +558,9 @@ def build_parser() -> argparse.ArgumentParser:
         description="Minimal sbatch interception helper.",
     )
     parser.add_argument(
+        "--version", action="version", version=f"%(prog)s {__version__}"
+    )
+    parser.add_argument(
         "--dry-run", action="store_true", help="simulate sbatch submissions"
     )
     parser.add_argument(
@@ -569,6 +583,13 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("show", help="show captured submissions")
     subparsers.add_parser("watch", help="show current Slurm jobs")
     subparsers.add_parser("doctor", help="check sbatch discovery")
+    update_parser = subparsers.add_parser("update", help="update this executable")
+    update_parser.add_argument(
+        "--check", action="store_true", help="only check whether an update is available"
+    )
+    update_parser.add_argument(
+        "--force", action="store_true", help="reinstall even when already current"
+    )
     subparsers.add_parser(
         "interactive", aliases=["shell", "ui"], help="open interactive shell"
     )
@@ -3058,6 +3079,163 @@ def doctor(args: argparse.Namespace) -> int:
     return 0
 
 
+def parse_version(value: str) -> tuple[int, ...] | None:
+    text = value.strip()
+    if text.startswith("v"):
+        text = text[1:]
+    if not text:
+        return None
+    parts = text.split(".")
+    numbers = []
+    for part in parts:
+        if not part.isdigit():
+            return None
+        numbers.append(int(part))
+    while len(numbers) < 3:
+        numbers.append(0)
+    return tuple(numbers)
+
+
+def update_request(url: str) -> urllib.request.Request:
+    return urllib.request.Request(
+        url,
+        headers={
+            "Accept": "application/vnd.github+json, application/octet-stream",
+            "User-Agent": f"slurmctl/{__version__}",
+        },
+    )
+
+
+def read_url(url: str, *, timeout: float = 20.0) -> bytes:
+    with urllib.request.urlopen(update_request(url), timeout=timeout) as response:
+        return response.read()
+
+
+def latest_release_info() -> tuple[str, str]:
+    api_url = os.environ.get("SLURMCTL_UPDATE_API_URL", LATEST_RELEASE_API_URL)
+    fallback_asset_url = os.environ.get(
+        "SLURMCTL_UPDATE_ASSET_URL", LATEST_RELEASE_ASSET_URL
+    )
+    try:
+        payload = json.loads(read_url(api_url).decode("utf-8"))
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"failed to read latest release metadata: {exc}") from exc
+
+    tag = str(payload.get("tag_name") or "").strip()
+    if not tag:
+        raise RuntimeError("latest release metadata did not include tag_name")
+    asset_url = fallback_asset_url
+    for asset in payload.get("assets") or []:
+        if asset.get("name") == RELEASE_ASSET_NAME and asset.get(
+            "browser_download_url"
+        ):
+            asset_url = str(asset["browser_download_url"])
+            break
+    return tag, asset_url
+
+
+def current_executable_path() -> Path:
+    raw = sys.argv[0]
+    found = shutil.which(raw) if os.sep not in raw else None
+    return Path(found or raw).resolve()
+
+
+def validate_downloaded_executable(path: Path) -> tuple[bool, str]:
+    try:
+        data = path.read_bytes()
+    except OSError as exc:
+        return False, f"cannot read downloaded file: {exc}"
+    if b"__version__" not in data or b"Minimal sbatch interception helper" not in data:
+        return False, "downloaded file does not look like slurmctl"
+    proc = subprocess.run(
+        [sys.executable, str(path), "--help"],
+        text=True,
+        capture_output=True,
+        timeout=10,
+    )
+    if proc.returncode != 0:
+        output = (proc.stdout + proc.stderr).strip()
+        return False, output or f"validation exited {proc.returncode}"
+    return True, ""
+
+
+def write_update_candidate(target: Path, data: bytes) -> Path:
+    fd, tmp_name = tempfile.mkstemp(
+        prefix=f".{target.name}.", suffix=".tmp", dir=str(target.parent)
+    )
+    tmp_path = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        mode = target.stat().st_mode if target.exists() else 0o755
+        tmp_path.chmod(mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+        return tmp_path
+    except Exception:
+        try:
+            tmp_path.unlink()
+        except OSError:
+            pass
+        raise
+
+
+def update(args: argparse.Namespace) -> int:
+    try:
+        latest_tag, asset_url = latest_release_info()
+    except RuntimeError as exc:
+        print(f"slurmctl: {exc}", file=sys.stderr)
+        return 1
+
+    current_version = parse_version(__version__)
+    latest_version = parse_version(latest_tag)
+    if latest_version is None:
+        print(f"slurmctl: latest release tag is not semver-like: {latest_tag}", file=sys.stderr)
+        return 1
+
+    print(f"current: {__version__}")
+    print(f"latest:  {latest_tag}")
+    if args.check:
+        if current_version is not None and latest_version > current_version:
+            print("update available")
+            return 1
+        print("slurmctl is already up to date")
+        return 0
+    if current_version is not None and latest_version <= current_version and not args.force:
+        print("slurmctl is already up to date")
+        return 0
+
+    target = current_executable_path()
+    if target.name == "slurmctl.py":
+        print(
+            "slurmctl: refusing to self-update slurmctl.py; install the release asset as 'slurmctl' first",
+            file=sys.stderr,
+        )
+        return 2
+    if not target.exists():
+        print(f"slurmctl: executable not found: {target}", file=sys.stderr)
+        return 2
+    if not os.access(target.parent, os.W_OK):
+        print(f"slurmctl: cannot write to {target.parent}", file=sys.stderr)
+        return 2
+
+    try:
+        data = read_url(asset_url)
+        tmp_path = write_update_candidate(target, data)
+        ok, reason = validate_downloaded_executable(tmp_path)
+        if not ok:
+            tmp_path.unlink(missing_ok=True)
+            print(f"slurmctl: downloaded update failed validation: {reason}", file=sys.stderr)
+            return 1
+        os.replace(tmp_path, target)
+    except (OSError, urllib.error.URLError, subprocess.SubprocessError) as exc:
+        print(f"slurmctl: update failed: {exc}", file=sys.stderr)
+        return 1
+
+    print(f"updated slurmctl {__version__} -> {latest_tag}")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
     parser = build_parser()
@@ -3106,6 +3284,8 @@ def main(argv: list[str] | None = None) -> int:
         return watch(args)
     if args.command == "doctor":
         return doctor(args)
+    if args.command == "update":
+        return update(args)
     if args.command in {None, "interactive", "shell", "ui"}:
         return InteractiveShell(args).run()
     parser.print_help()

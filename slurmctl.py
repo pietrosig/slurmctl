@@ -25,7 +25,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 GITHUB_REPO = "pietrosig/slurmctl"
 RELEASE_ASSET_NAME = "slurmctl"
 LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -574,7 +574,14 @@ def build_parser() -> argparse.ArgumentParser:
     sbatch_parser.add_argument("sbatch_args", nargs=argparse.REMAINDER)
 
     subparsers.add_parser("show", help="show captured submissions")
-    subparsers.add_parser("watch", help="show current Slurm jobs")
+    watch_parser = subparsers.add_parser(
+        "watch", help="watch current Slurm jobs (interactive in a terminal)"
+    )
+    watch_parser.add_argument(
+        "--plain",
+        action="store_true",
+        help="print the job table once and exit instead of opening the watch view",
+    )
     subparsers.add_parser("doctor", help="check sbatch discovery")
     update_parser = subparsers.add_parser("update", help="update this executable")
     update_parser.add_argument(
@@ -1484,8 +1491,9 @@ def watch(args: argparse.Namespace) -> int:
 
 
 class InteractiveShell:
-    def __init__(self, args: argparse.Namespace):
+    def __init__(self, args: argparse.Namespace, initial_view: str = "home"):
         self.args = args
+        self.initial_view = initial_view
         self.settings = load_settings()
         self.editing_setting: str | None = None
         self.confirm_kind = ""
@@ -1552,6 +1560,9 @@ class InteractiveShell:
         screen.keypad(True)
         screen.timeout(100)
         self.schedule_watch_refresh()
+        if self.initial_view != "home":
+            self.switch_view(self.initial_view)
+            self.prepare_view(self.view)
         while True:
             self.tick()
             if self.dirty:
@@ -3597,7 +3608,9 @@ def main(argv: list[str] | None = None) -> int:
     if args.command == "show":
         return show(args)
     if args.command == "watch":
-        return watch(args)
+        if args.plain or not (sys.stdin.isatty() and sys.stdout.isatty()):
+            return watch(args)
+        return InteractiveShell(args, initial_view="watch").run()
     if args.command == "doctor":
         return doctor(args)
     if args.command == "update":

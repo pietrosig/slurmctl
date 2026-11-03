@@ -172,7 +172,12 @@ and stderr path.
 
 ```bash
 slurmctl watch
+slurmctl watch --plain
 ```
+
+In a terminal, opens the interactive shell directly on the watch view. When
+output is piped or redirected, or with `--plain`, prints the job table once and
+exits.
 
 Uses `squeue --me` when available. If `sacct` is available, watch also includes
 jobs that finished in the last 24 hours. If `squeue` is not installed, it falls

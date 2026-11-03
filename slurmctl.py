@@ -7,6 +7,7 @@ import argparse
 import curses
 import datetime as dt
 import errno
+import fcntl
 import getpass
 import json
 import os
@@ -26,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-__version__ = "0.1.6"
+__version__ = "0.1.7"
 GITHUB_REPO = "pietrosig/slurmctl"
 RELEASE_ASSET_NAME = "slurmctl"
 LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -590,6 +591,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     update_parser.add_argument(
         "--force", action="store_true", help="reinstall even when already current"
+    )
+    update_parser.add_argument(
+        "--background", action="store_true", help=argparse.SUPPRESS
     )
     subparsers.add_parser(
         "interactive", aliases=["shell", "ui"], help="open interactive shell"
@@ -1693,7 +1697,7 @@ class InteractiveShell:
         self.panel_cursors: dict[str, tuple[int, int]] = {}
         self.panel_cursor_keys: dict[str, str] = {}
         self.reset_selection()
-        self.message = ""
+        self.message = getattr(args, "startup_message", "") or ""
         self.dirty = True
         self.watch_cache: list[dict] = []
         self.watch_source = "not loaded"
@@ -3800,6 +3804,8 @@ def write_update_candidate(target: Path, data: bytes) -> Path:
 
 
 def update(args: argparse.Namespace) -> int:
+    if getattr(args, "background", False):
+        return background_update()
     try:
         latest_tag, asset_url = latest_release_info()
     except RuntimeError as exc:
@@ -3831,20 +3837,40 @@ def update(args: argparse.Namespace) -> int:
         print("slurmctl is already up to date")
         return 0
 
+    target, problem = self_update_target()
+    if target is None:
+        print(f"slurmctl: {problem}", file=sys.stderr)
+        return 2
+    ok, reason = install_release(target, latest_tag, asset_url)
+    if not ok:
+        print(f"slurmctl: {reason}", file=sys.stderr)
+        return 1
+    print(f"updated slurmctl {__version__} -> {latest_tag}")
+    return 0
+
+
+AUTO_UPDATE_INTERVAL_SECONDS = 24 * 60 * 60
+AUTO_UPDATE_DISABLE_ENV = "SLURMCTL_NO_AUTO_UPDATE"
+AUTO_UPDATE_COMMANDS = {None, "interactive", "shell", "ui", "watch", "show", "run", "doctor"}
+
+
+def self_update_target() -> tuple[Path | None, str]:
+    """The installed executable to replace, or None with the reason why not."""
     target = current_executable_path()
     if target.name == "slurmctl.py":
-        print(
-            "slurmctl: refusing to self-update slurmctl.py; install the release asset as 'slurmctl' first",
-            file=sys.stderr,
+        return None, (
+            "refusing to self-update slurmctl.py; install the release asset as "
+            "'slurmctl' first"
         )
-        return 2
     if not target.exists():
-        print(f"slurmctl: executable not found: {target}", file=sys.stderr)
-        return 2
+        return None, f"executable not found: {target}"
     if not os.access(target.parent, os.W_OK):
-        print(f"slurmctl: cannot write to {target.parent}", file=sys.stderr)
-        return 2
+        return None, f"cannot write to {target.parent}"
+    return target, ""
 
+
+def install_release(target: Path, latest_tag: str, asset_url: str) -> tuple[bool, str]:
+    """Download, validate and atomically swap in a release over `target`."""
     try:
         data = read_url(asset_url)
         tmp_path = write_update_candidate(target, data)
@@ -3853,18 +3879,136 @@ def update(args: argparse.Namespace) -> int:
         )
         if not ok:
             tmp_path.unlink(missing_ok=True)
-            print(
-                f"slurmctl: downloaded update failed validation: {reason}",
-                file=sys.stderr,
-            )
-            return 1
+            return False, f"downloaded update failed validation: {reason}"
         os.replace(tmp_path, target)
     except (OSError, urllib.error.URLError, subprocess.SubprocessError) as exc:
-        print(f"slurmctl: update failed: {exc}", file=sys.stderr)
-        return 1
+        return False, f"update failed: {exc}"
+    return True, ""
 
-    print(f"updated slurmctl {__version__} -> {latest_tag}")
-    return 0
+
+def update_state_path() -> Path:
+    return config_path().parent / "update-state.json"
+
+
+def load_update_state() -> dict:
+    try:
+        state = json.loads(update_state_path().read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def save_update_state(state: dict) -> None:
+    path = update_state_path()
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+        tmp.write_text(json.dumps(state, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def auto_update_disabled() -> bool:
+    return os.environ.get(AUTO_UPDATE_DISABLE_ENV, "").strip().lower() not in {
+        "",
+        "0",
+        "false",
+        "no",
+    }
+
+
+def maybe_start_background_update() -> None:
+    """Spawn a detached `update --background` at most once per interval.
+
+    It never blocks startup: the new version replaces the executable on disk
+    and takes effect the next time slurmctl starts.
+    """
+    if auto_update_disabled():
+        return
+    target, _ = self_update_target()
+    if target is None:
+        return
+    state = load_update_state()
+    now = time.time()
+    try:
+        last_check = float(state.get("last_check") or 0)
+    except (TypeError, ValueError):
+        last_check = 0.0
+    if 0 <= now - last_check < AUTO_UPDATE_INTERVAL_SECONDS:
+        return
+    # Record the attempt before spawning so a failing child cannot cause a
+    # check on every start.
+    state["last_check"] = now
+    save_update_state(state)
+    env = dict(os.environ, **{AUTO_UPDATE_DISABLE_ENV: "1"})
+    try:
+        subprocess.Popen(
+            [sys.executable, str(target), "update", "--background"],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+            close_fds=True,
+            env=env,
+        )
+    except OSError:
+        pass
+
+
+def background_update() -> int:
+    """Quiet self-update run by maybe_start_background_update; never prompts."""
+    lock_path = update_state_path().with_name("update.lock")
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        lock_handle = lock_path.open("w")
+    except OSError:
+        return 1
+    with lock_handle:
+        try:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            return 0  # another update is already running
+        state = load_update_state()
+        state["last_check"] = time.time()
+        state.pop("last_error", None)
+        try:
+            latest_tag, asset_url = latest_release_info()
+            latest_version = parse_version(latest_tag)
+            current_version = parse_version(__version__)
+            if latest_version is None:
+                raise RuntimeError(f"latest release tag is not semver-like: {latest_tag}")
+            if current_version is not None and latest_version <= current_version:
+                save_update_state(state)
+                return 0
+            target, problem = self_update_target()
+            if target is None:
+                raise RuntimeError(problem)
+            ok, reason = install_release(target, latest_tag, asset_url)
+            if not ok:
+                raise RuntimeError(reason)
+        except RuntimeError as exc:
+            state["last_error"] = str(exc)
+            save_update_state(state)
+            return 1
+        state["updated_from"] = __version__
+        state["updated_to"] = latest_tag.lstrip("v")
+        state["notified"] = False
+        save_update_state(state)
+        return 0
+
+
+def take_update_notice() -> str:
+    """One-time 'updated' message for the first run on a new version."""
+    state = load_update_state()
+    updated_to = state.get("updated_to")
+    if not updated_to or state.get("notified"):
+        return ""
+    if parse_version(str(updated_to)) != parse_version(__version__):
+        return ""
+    state["notified"] = True
+    save_update_state(state)
+    return f"slurmctl updated {state.get('updated_from') or '?'} -> {__version__}"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -3904,6 +4048,20 @@ def main(argv: list[str] | None = None) -> int:
         or getattr(args, "slurmctl_dir", None)
         or settings["slurmctl_dir"]
     )
+
+    if args.command in AUTO_UPDATE_COMMANDS:
+        maybe_start_background_update()
+        notice = take_update_notice()
+        if notice:
+            if args.command in {None, "interactive", "shell", "ui"} or (
+                args.command == "watch"
+                and not args.plain
+                and sys.stdin.isatty()
+                and sys.stdout.isatty()
+            ):
+                args.startup_message = notice
+            elif sys.stderr.isatty():
+                print(notice, file=sys.stderr)
 
     if args.command == "run":
         return run_script(args)

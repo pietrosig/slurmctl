@@ -55,6 +55,21 @@ Check for an update without changing the installed executable:
 slurmctl update --check
 ```
 
+Updates also happen automatically. At most once a day, starting `slurmctl`
+(or `watch`, `show`, `run`, `doctor`) checks for a new release in a detached
+background process, so startup is not slowed down. A new version is
+downloaded, validated and swapped in atomically, and takes effect the next time
+you start `slurmctl`, which then shows a one-time "updated" notice. `sbatch`
+never triggers a check, and a development checkout (`slurmctl.py`) is never
+self-updated. Failures are silent and recorded in
+`~/.config/slurmctl/update-state.json`.
+
+Turn automatic updates off with:
+
+```bash
+export SLURMCTL_NO_AUTO_UPDATE=1
+```
+
 Optional plain `sbatch` capture:
 
 ```bash

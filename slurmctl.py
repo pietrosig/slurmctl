@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import tempfile
+import textwrap
 import threading
 import time
 import urllib.error
@@ -1490,6 +1491,186 @@ def watch(args: argparse.Namespace) -> int:
     return 0
 
 
+def _terminal_supports_unicode() -> bool:
+    try:
+        import locale
+
+        return "utf" in locale.nl_langinfo(locale.CODESET).lower()
+    except (ImportError, AttributeError, ValueError):
+        return False
+
+
+ELLIPSIS = "…" if _terminal_supports_unicode() else "~"
+UI_GUTTER = 1
+UI_COLUMN_GAP = 2
+
+
+def fit_text(text: object, width: int, mode: str = "end") -> str:
+    """Shorten text to at most `width` cells, marking the cut with an ellipsis.
+
+    mode "end" keeps the start (names, prose); "middle" keeps both ends
+    (paths, where the filename matters); "start" keeps the end (typed input).
+    """
+    text = str(text)
+    if width <= 0:
+        return ""
+    if len(text) <= width:
+        return text
+    if width <= len(ELLIPSIS):
+        return text[:width]
+    keep = width - len(ELLIPSIS)
+    if mode == "middle":
+        head = (keep + 1) // 2
+        tail = keep - head
+        return text[:head] + ELLIPSIS + (text[-tail:] if tail else "")
+    if mode == "start":
+        return ELLIPSIS + text[-keep:]
+    return text[:keep] + ELLIPSIS
+
+
+def display_path(path: Path | str) -> str:
+    """Show paths under $HOME as ~/... to save width."""
+    text = str(path)
+    home = str(Path.home())
+    if text == home:
+        return "~"
+    if text.startswith(home + os.sep):
+        return "~" + text[len(home) :]
+    return text
+
+
+def fit_segments(
+    segments: list[tuple[str, int]], width: int, sep: str = " | ", mode: str = "end"
+) -> str:
+    """Join (text, priority) segments, dropping the least important (highest
+    priority number) whole segments until the result fits in `width`."""
+    kept = [(idx, text, prio) for idx, (text, prio) in enumerate(segments) if text]
+
+    def joined() -> str:
+        return sep.join(text for _, text, _ in kept)
+
+    while len(kept) > 1 and len(joined()) > width:
+        drop = max(kept, key=lambda item: (item[2], item[0]))
+        kept.remove(drop)
+    return fit_text(joined(), width, mode)
+
+
+@dataclass
+class Column:
+    key: str
+    label: str
+    priority: int
+    min_width: int
+    max_width: int | None = None
+    flex: int = 0
+    truncate: str = "end"
+
+
+def layout_columns(
+    columns: list[Column],
+    rows: list[dict[str, str]],
+    width: int,
+    gap: int = UI_COLUMN_GAP,
+) -> list[tuple[Column, int]]:
+    """Choose which columns to show and how wide each one is.
+
+    Columns are dropped lowest-priority first until their minimum widths fit.
+    Leftover space first grows fixed columns to their natural width, then is
+    shared between flex columns by weight.
+    """
+    natural: dict[str, int] = {}
+    for column in columns:
+        size = max([len(column.label)] + [len(row.get(column.key, "")) for row in rows])
+        if column.max_width is not None:
+            size = min(size, column.max_width)
+        natural[column.key] = size
+
+    def minimum(column: Column) -> int:
+        return min(column.min_width, natural[column.key])
+
+    visible = list(columns)
+
+    def required() -> int:
+        return sum(minimum(c) for c in visible) + gap * max(0, len(visible) - 1)
+
+    while len(visible) > 1 and required() > width:
+        visible.remove(max(visible, key=lambda c: c.priority))
+
+    widths = {c.key: minimum(c) for c in visible}
+    spare = max(0, width - required())
+    for column in sorted(
+        (c for c in visible if not c.flex), key=lambda c: c.priority
+    ):
+        grow = min(spare, natural[column.key] - widths[column.key])
+        widths[column.key] += grow
+        spare -= grow
+
+    flexible = [c for c in visible if c.flex]
+    while spare > 0:
+        hungry = [c for c in flexible if widths[c.key] < natural[c.key]]
+        if not hungry:
+            break
+        total_weight = sum(c.flex for c in hungry)
+        handed_out = 0
+        for column in hungry:
+            share = max(1, spare * column.flex // total_weight)
+            grow = min(share, natural[column.key] - widths[column.key], spare - handed_out)
+            widths[column.key] += grow
+            handed_out += grow
+            if handed_out >= spare:
+                break
+        spare -= handed_out
+        if handed_out == 0:
+            break
+
+    if visible:
+        # Let the last column absorb what is left so long values are not cut
+        # when there is room for them.
+        last = visible[-1]
+        widths[last.key] = max(widths[last.key], widths[last.key] + spare)
+    return [(c, widths[c.key]) for c in visible]
+
+
+def render_columns(
+    layout: list[tuple[Column, int]], row: dict[str, str], gap: int = UI_COLUMN_GAP
+) -> str:
+    cells = [
+        fit_text(row.get(column.key, ""), size, column.truncate).ljust(size)
+        for column, size in layout
+    ]
+    return (" " * gap).join(cells)
+
+
+def render_column_header(
+    layout: list[tuple[Column, int]], gap: int = UI_COLUMN_GAP
+) -> str:
+    return render_columns(layout, {c.key: c.label for c, _ in layout}, gap)
+
+
+WATCH_COLUMNS = [
+    Column("job_id", "JOB_ID", priority=0, min_width=8, max_width=14),
+    Column("state", "STATE", priority=1, min_width=7, max_width=12),
+    Column("elapsed", "ELAPSED", priority=3, min_width=7, max_width=11),
+    Column("nodes", "NODES", priority=5, min_width=5, max_width=6),
+    Column("name", "NAME", priority=2, min_width=16, flex=3),
+    Column("reason", "REASON", priority=4, min_width=12, flex=2),
+]
+
+SUBMISSION_COLUMNS = [
+    Column("job_id", "JOB_ID", priority=0, min_width=6, max_width=14),
+    Column("hash", "HASH", priority=4, min_width=8, max_width=8),
+    Column("script", "SCRIPT", priority=1, min_width=10, flex=2, truncate="middle"),
+    Column("out", "OUT", priority=2, min_width=12, flex=2, truncate="middle"),
+    Column("err", "ERR", priority=3, min_width=12, flex=2, truncate="middle"),
+]
+
+MENU_COLUMNS = [
+    Column("key", "", priority=0, min_width=4, max_width=6),
+    Column("name", "", priority=1, min_width=8, max_width=18),
+    Column("detail", "", priority=2, min_width=16, flex=1),
+]
+
+
 class InteractiveShell:
     def __init__(self, args: argparse.Namespace, initial_view: str = "home"):
         self.args = args
@@ -1972,8 +2153,7 @@ class InteractiveShell:
             self.draw_sbatch_wrapper(height, width)
 
         if height > 2:
-            status = self.status_line()
-            self.add(height - 2, 0, status[: width - 1])
+            self.add_row(height - 2, width, self.status_text(self.content_width(width)))
         prompt = {
             "home": "Search commands",
             "run": "Search/type script path",
@@ -1988,30 +2168,116 @@ class InteractiveShell:
             "sbatch_wrapper": "Search actions",
         }.get(self.view, "Search")
         marker = "*" if self.search_active else " "
-        self.add(
-            height - 1,
-            0,
-            f"{marker} {prompt}: {self.query}"[: width - 1],
-            curses.A_REVERSE,
-        )
+        label = f" {marker} {prompt}: "
+        bar_width = max(0, width - 1)
+        if len(label) + 8 > bar_width:
+            label = f" {marker} "
+        query = fit_text(self.query, max(0, bar_width - len(label)), "start")
+        self.add(height - 1, 0, (label + query).ljust(bar_width), curses.A_REVERSE)
         self.screen.refresh()
 
-    def status_line(self) -> str:
+    def content_width(self, width: int) -> int:
+        """Usable columns between the left gutter and the right margin."""
+        return max(0, width - 2 * UI_GUTTER)
+
+    def add_row(
+        self, y: int, width: int, text: str, attr: int = curses.A_NORMAL
+    ) -> None:
+        """Draw one full-width content row, so highlights span the screen."""
+        size = self.content_width(width)
+        self.add(y, UI_GUTTER, fit_text(text, size).ljust(size), attr)
+
+    def status_hints(self) -> list[tuple[str, int]]:
         if self.view == "confirm":
             if self.confirm_kind == "rerun_dependency":
-                return "Enter select | E exact | D no dependency | B back"
-            return "Enter select | Y yes | F false | B back"
+                return [
+                    ("Enter select", 2),
+                    ("E exact", 0),
+                    ("D no dependency", 0),
+                    ("B back", 1),
+                ]
+            return [("Enter select", 2), ("Y yes", 0), ("F false", 0), ("B back", 1)]
         if self.view == "sbatch_wrapper":
-            return self.message or "Enter select | I install | U uninstall | B back"
+            return [
+                ("Enter select", 2),
+                ("I install", 0),
+                ("U uninstall", 0),
+                ("B back", 1),
+            ]
         if self.watch_visual_active():
-            if self.message:
-                return self.message
             count = len(self.selected_watch_jobs())
-            return f"Visual: {count} selected | Enter actions | up/down extend | v clear | B back"
-        return (
-            self.message
-            or "Enter select | arrows move | Tab search on/off | B back | q quit"
-        )
+            return [
+                (f"Visual: {count} selected", 0),
+                ("Enter actions", 1),
+                ("up/down extend", 3),
+                ("v clear", 2),
+                ("B back", 1),
+            ]
+        return [
+            ("Enter select", 2),
+            ("arrows move", 4),
+            ("Tab search", 3),
+            ("B back", 1),
+            ("q quit", 0),
+        ]
+
+    def status_text(self, width: int) -> str:
+        if self.message:
+            return fit_text(self.message, width)
+        return fit_segments(self.status_hints(), width)
+
+    def header_context(self) -> tuple[list[tuple[str, int]], str]:
+        """Context shown on the right of the header, as droppable segments."""
+        if self.view == "show":
+            shown = len(self.filtered_submissions())
+            total = len(self.submissions_cache)
+            return [(f"{shown}/{total} submissions", 0)], "end"
+        if self.view == "watch":
+            shown = sum(
+                1
+                for item in self.filtered_watch_jobs()
+                if not is_watch_load_more_item(item)
+            )
+            segments = [(f"{shown}/{len(self.watch_cache)} jobs", 0)]
+            segments.append((self.watch_source, 3))
+            if self.watch_refreshing:
+                segments.append(("refreshing", 1))
+            if self.watch_error:
+                segments.append((self.watch_error, 2))
+            return segments, "end"
+        if self.view == "run":
+            return [(f"{len(self.filtered_scripts())} scripts", 0)], "end"
+        if self.view == "actions":
+            record = getattr(self, "active_record", None) or {}
+            return [
+                (f"job {record.get('job_id') or '-'}", 0),
+                (str(record.get("script_path") or ""), 1),
+            ], "middle"
+        if self.view == "watch_actions":
+            job = getattr(self, "active_job", None) or {}
+            return [
+                (f"job {job.get('job_id') or '-'}", 0),
+                (str(job.get("state") or ""), 1),
+            ], "end"
+        if self.view == "watch_multi_actions":
+            return [(f"{len(self.active_watch_records)} selected", 0)], "end"
+        if self.view == "confirm":
+            return [(self.confirm_kind or "confirm", 0)], "end"
+        if self.view == "settings":
+            return [(display_path(config_path()), 0)], "middle"
+        if self.view == "sbatch_wrapper":
+            status = sbatch_wrapper_status()
+            if status["conflict"]:
+                state = "conflict"
+            elif status["installed"]:
+                state = "active" if status["active"] else "installed"
+            else:
+                state = "not installed"
+            return [
+                (state, 0),
+                (f"real {status['real_sbatch'] or 'not found'}", 1),
+            ], "middle"
+        return [(display_path(Path.cwd()), 0)], "middle"
 
     def draw_header(self, height: int, width: int) -> None:
         if height < 2:
@@ -2029,117 +2295,153 @@ class InteractiveShell:
             "settings": "Settings",
             "sbatch_wrapper": "Install sbatch",
         }.get(self.view, self.view.title())
-        if self.view == "show":
-            context = f"{len(self.filtered_submissions())} shown / {len(self.submissions_cache)} total"
-        elif self.view == "watch":
-            shown = sum(
-                1
-                for item in self.filtered_watch_jobs()
-                if not is_watch_load_more_item(item)
-            )
-            context = (
-                f"{shown} shown / {len(self.watch_cache)} total | {self.watch_source}"
-            )
-            if self.watch_refreshing:
-                context += " | refreshing"
-            if self.watch_error:
-                context += f" | {self.watch_error}"
-        elif self.view == "run":
-            context = f"{len(self.filtered_scripts())} scripts"
-        elif self.view == "actions":
-            record = getattr(self, "active_record", None) or {}
-            context = f"job {record.get('job_id') or '-'} | {record.get('script_path') or '-'}"
-        elif self.view == "watch_actions":
-            job = getattr(self, "active_job", None) or {}
-            context = f"job {job.get('job_id') or '-'} | {job.get('state') or '-'}"
-        elif self.view == "watch_multi_actions":
-            context = f"{len(self.active_watch_records)} selected jobs"
-        elif self.view == "confirm":
-            context = self.confirm_kind or "confirm"
-        elif self.view == "settings":
-            context = str(config_path())
-        elif self.view == "sbatch_wrapper":
-            status = sbatch_wrapper_status()
-            if status["conflict"]:
-                state = "conflict"
-            elif status["installed"]:
-                state = "active" if status["active"] else "installed"
-            else:
-                state = "not installed"
-            context = f"{state} | real {status['real_sbatch'] or 'not found'}"
-        else:
-            context = str(Path.cwd())
-        line = f" slurmctl  >  {view_title}  |  {context}"
-        self.add(0, 0, line.ljust(width - 1)[: width - 1], curses.A_REVERSE)
-        self.add(1, 0, ("-" * max(0, width - 1))[: width - 1])
+        bar_width = max(0, width - 1)
+        left = f" slurmctl > {view_title}"
+        if len(left) > bar_width:
+            left = f" {view_title}"
+        segments, mode = self.header_context()
+        room = bar_width - len(left) - 4
+        context = fit_segments(segments, room, mode=mode) if room >= 8 else ""
+        line = left
+        if context:
+            line = left + context.rjust(bar_width - len(left) - 1) + " "
+        self.add(0, 0, line.ljust(bar_width)[:bar_width], curses.A_REVERSE)
 
     def draw_home(self, height: int, width: int) -> None:
         items = self.filtered_home()
         self.clamp_selected(len(items))
+        size = self.content_width(width)
+        name_width = max((len(item["name"]) for item in self.home_items), default=0)
+        show_detail = size - name_width - UI_COLUMN_GAP >= 12
         start, visible = self.visible_slice(items, self.content_rows(height, 2))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = (
                 curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             )
-            self.add(
-                idx + 2, 2, f"{item['name']:<15} {item['detail']}"[: width - 4], attr
-            )
+            row = f" {item['name']}"
+            if show_detail:
+                row = f" {item['name']:<{name_width}}" + " " * UI_COLUMN_GAP + item["detail"]
+            self.add_row(idx + 2, width, row, attr)
 
     def draw_run(self, height: int, width: int) -> None:
         items = self.filtered_scripts()
         self.clamp_selected(len(items))
-        self.add(
+        size = self.content_width(width)
+        self.add_row(
             2,
-            2,
-            "Enter runs the selected script, or the typed path if there is no match."[
-                : width - 4
-            ],
+            width,
+            " Enter runs the selected script, or the typed path if there is no match.",
+            curses.A_DIM,
         )
+        cwd = Path.cwd()
         start, visible = self.visible_slice(items, self.content_rows(height, 4))
         for idx, item in enumerate(visible):
             absolute_idx = start + idx
             attr = (
                 curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             )
-            self.add(idx + 4, 2, item["path"][: width - 4], attr)
+            path = Path(item["path"])
+            try:
+                shown = str(path.relative_to(cwd))
+            except ValueError:
+                shown = str(path)
+            self.add_row(idx + 4, width, " " + fit_text(shown, size - 1, "middle"), attr)
+
+    def draw_table(
+        self,
+        columns: list[Column],
+        rows: list[dict[str, str]],
+        header_y: int,
+        width: int,
+    ) -> list[tuple[Column, int]]:
+        layout = layout_columns(columns, rows, max(0, self.content_width(width) - 1))
+        self.add_row(header_y, width, " " + render_column_header(layout), curses.A_BOLD)
+        return layout
+
+    @staticmethod
+    def submission_cells(item: dict) -> dict[str, str]:
+        return {
+            "job_id": str(item.get("job_id") or "-"),
+            "hash": str(item.get("command_hash") or "-")[:8],
+            "script": str(item.get("script_path") or "-"),
+            "out": str(item.get("resolved_stdout_path") or "-"),
+            "err": str(item.get("resolved_stderr_path") or "-"),
+        }
 
     def draw_show(self, height: int, width: int) -> None:
         items = self.filtered_submissions()
         self.clamp_selected(len(items))
-        header = f"{'JOB_ID':<8} {'HASH':<16} {'SCRIPT':<22} {'OUT':<24} ERR"
-        self.add(2, 0, header[: width - 1], curses.A_BOLD)
+        cells = [self.submission_cells(item) for item in items]
+        layout = self.draw_table(SUBMISSION_COLUMNS, cells, 2, width)
         start, visible = self.visible_slice(items, self.content_rows(height, 3))
-        for idx, item in enumerate(visible):
+        for idx in range(len(visible)):
             absolute_idx = start + idx
             attr = (
                 curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             )
-            row = (
-                f"{item.get('job_id') or '-':<8} "
-                f"{item.get('command_hash') or '-':<16} "
-                f"{item.get('script_path') or '-':<22} "
-                f"{item.get('resolved_stdout_path') or '-':<24} "
-                f"{item.get('resolved_stderr_path') or '-'}"
-            )
-            self.add(idx + 3, 0, row[: width - 1], attr)
+            row = " " + render_columns(layout, cells[absolute_idx])
+            self.add_row(idx + 3, width, row, attr)
+
+    @staticmethod
+    def watch_cells(item: dict) -> dict[str, str]:
+        if is_watch_load_more_item(item):
+            return {"name": "[ Load more ]", "reason": str(item.get("reason") or "")}
+        return {
+            "job_id": str(item.get("job_id") or "-"),
+            "state": str(item.get("state") or "-"),
+            "elapsed": str(item.get("elapsed") or "-"),
+            "nodes": str(item.get("nodes") or "-"),
+            "name": str(item.get("job_name") or "-"),
+            "reason": str(item.get("reason") or "-"),
+        }
+
+    def fit_grouped_slice(
+        self, items: list[dict], max_rows: int
+    ) -> tuple[int, list[dict]]:
+        """Largest visible slice whose rows plus group dividers fit max_rows."""
+        rows = max(0, max_rows)
+        while True:
+            start, visible = self.visible_slice(items, rows)
+            previous = job_group(items[start - 1]) if 0 < start <= len(items) else None
+            dividers = 0
+            for item in visible:
+                group = job_group(item)
+                if previous and group != previous:
+                    dividers += 1
+                previous = group
+            if rows <= 1 or len(visible) + dividers <= max_rows:
+                return start, visible
+            rows -= 1
 
     def draw_watch(self, height: int, width: int) -> None:
         items = self.filtered_watch_jobs()
         self.clamp_selected(len(items))
         bounds = self.watch_visual_bounds(len(items))
         stats = watch_stats(self.watch_cache)
-        stats_line = (
-            f"running {stats['running']} | "
-            f"pending {stats['pending']} | "
-            f"finished last {self.watch_finished_hours}h {stats['finished']}"
+        stats_line = fit_segments(
+            [
+                (f"running {stats['running']}", 0),
+                (f"pending {stats['pending']}", 0),
+                (
+                    f"finished last {self.watch_finished_hours}h {stats['finished']}",
+                    1,
+                ),
+            ],
+            self.content_width(width) - 1,
         )
-        self.add(2, 0, stats_line[: width - 1], curses.A_BOLD)
-        header = f"{'JOB_ID':<8} {'STATE':<12} {'ELAPSED':<10} {'NODES':<6} {'NAME':<22} REASON"
-        self.add(3, 0, header[: width - 1], curses.A_BOLD)
-        max_rows = self.content_rows(height, 4)
-        start, visible = self.visible_slice(items, max(0, max_rows - 3))
-        row_y = 4
+        self.add_row(2, width, " " + stats_line, curses.A_BOLD)
+        cells = [self.watch_cells(item) for item in items]
+        layout = self.draw_table(
+            WATCH_COLUMNS,
+            [cell for cell, item in zip(cells, items) if not is_watch_load_more_item(item)],
+            4,
+            width,
+        )
+        visible_keys = {column.key for column, _ in layout}
+        max_rows = self.content_rows(height, 5)
+        start, visible = self.fit_grouped_slice(items, max_rows)
+        row_y = 5
         previous_group = (
             job_group(items[start - 1]) if start > 0 and start <= len(items) else None
         )
@@ -2151,9 +2453,9 @@ class InteractiveShell:
                 and current_group != previous_group
                 and row_y <= height - 3
             ):
-                label = f" {current_group.upper()} "
-                divider = label.center(max(0, width - 1), "-")
-                self.add(row_y, 0, divider[: width - 1], curses.A_DIM)
+                label = f" -- {current_group.upper()} "
+                divider = label + "-" * max(0, self.content_width(width) - len(label))
+                self.add_row(row_y, width, divider, curses.A_DIM)
                 row_y += 1
             if row_y > height - 3:
                 break
@@ -2167,26 +2469,12 @@ class InteractiveShell:
             )
             if absolute_idx == self.selected:
                 attr |= curses.A_BOLD
+            row_cells = dict(cells[absolute_idx])
             if is_watch_load_more_item(item):
-                row = (
-                    f"{'':<8} "
-                    f"{'':<12} "
-                    f"{'':<10} "
-                    f"{'':<6} "
-                    f"{'[ Load more ]':<22} "
-                    f"{item.get('reason') or '-'}"
-                )
                 attr |= curses.A_BOLD
-            else:
-                row = (
-                    f"{item.get('job_id') or '-':<8} "
-                    f"{item.get('state') or '-':<12} "
-                    f"{item.get('elapsed') or '-':<10} "
-                    f"{item.get('nodes') or '-':<6} "
-                    f"{item.get('job_name') or '-':<22} "
-                    f"{item.get('reason') or '-'}"
-                )
-            self.add(row_y, 0, row[: width - 1], attr)
+                if "name" not in visible_keys and layout:
+                    row_cells[layout[0][0].key] = row_cells.pop("name")
+            self.add_row(row_y, width, " " + render_columns(layout, row_cells), attr)
             row_y += 1
             previous_group = current_group
 
@@ -2322,24 +2610,55 @@ class InteractiveShell:
             items, lambda item: f"{item['name']} {item['value']} {item['detail']}"
         )
 
-    def draw_settings(self, height: int, width: int) -> None:
-        items = self.settings_items()
+    def draw_menu(
+        self, items: list[dict], first_row: int, height: int, width: int
+    ) -> None:
+        """Draw key / name / detail action rows; detail is dropped when narrow."""
         self.clamp_selected(len(items))
-        self.add(
-            2,
-            2,
-            "Enter edits the selected setting. Empty editor means environment/default fallback."[
-                : width - 4
-            ],
+        cells = [
+            {"key": item["key"], "name": item["name"], "detail": item["detail"]}
+            for item in items
+        ]
+        layout = layout_columns(
+            MENU_COLUMNS, cells, max(0, self.content_width(width) - 1)
         )
-        start, visible = self.visible_slice(items, self.content_rows(height, 4))
-        for idx, item in enumerate(visible):
+        start, visible = self.visible_slice(
+            items, self.content_rows(height, first_row)
+        )
+        for idx in range(len(visible)):
             absolute_idx = start + idx
             attr = (
                 curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
             )
-            row = f"{item['name']:<18} {item['value']:<32} {item['detail']}"
-            self.add(idx + 4, 2, row[: width - 4], attr)
+            row = " " + render_columns(layout, cells[absolute_idx])
+            self.add_row(first_row + idx, width, row, attr)
+
+    def draw_settings(self, height: int, width: int) -> None:
+        items = self.settings_items()
+        self.clamp_selected(len(items))
+        self.add_row(
+            2,
+            width,
+            " Enter edits the selected setting. Empty editor means environment/default fallback.",
+            curses.A_DIM,
+        )
+        columns = [
+            Column("name", "", priority=0, min_width=10, max_width=18),
+            Column("value", "", priority=1, min_width=12, flex=2, truncate="middle"),
+            Column("detail", "", priority=2, min_width=16, flex=1),
+        ]
+        cells = [
+            {"name": item["name"], "value": str(item["value"]), "detail": item["detail"]}
+            for item in items
+        ]
+        layout = layout_columns(columns, cells, max(0, self.content_width(width) - 1))
+        start, visible = self.visible_slice(items, self.content_rows(height, 4))
+        for idx in range(len(visible)):
+            absolute_idx = start + idx
+            attr = (
+                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
+            )
+            self.add_row(idx + 4, width, " " + render_columns(layout, cells[absolute_idx]), attr)
 
     def sbatch_wrapper_items(self) -> list[dict]:
         actions = [
@@ -2372,67 +2691,48 @@ class InteractiveShell:
         else:
             installed = "no"
         active = "yes" if status["active"] else "no"
-        lines = [
+        size = self.content_width(width) - 1
+        intro = [
             "Optional wrapper for plain sbatch capture.",
             "With this installed, scripts that call sbatch behave like slurmctl sbatch.",
-            f"managed path: {status['path']}",
-            f"installed:    {installed}",
-            f"active PATH:  {active}",
-            f"real sbatch:  {status['real_sbatch'] or 'not found'}",
-            f"PATH sbatch:  {status['path_sbatch'] or 'not found'}",
         ]
+        facts = [
+            ("managed path", display_path(status["path"])),
+            ("installed", installed),
+            ("active PATH", active),
+            ("real sbatch", display_path(status["real_sbatch"] or "not found")),
+            ("PATH sbatch", display_path(status["path_sbatch"] or "not found")),
+        ]
+        label_width = max(len(label) for label, _ in facts) + UI_COLUMN_GAP
+        lines: list[tuple[str, int]] = [(intro[0], curses.A_BOLD), (intro[1], curses.A_NORMAL)]
+        for label, value in facts:
+            value_text = fit_text(value, max(0, size - label_width), "middle")
+            lines.append((f"{label:<{label_width}}{value_text}", curses.A_NORMAL))
         if status["installed"] and not status["active"]:
             lines.append(
-                f"hint: put {status['path'].parent} before the real sbatch directory on PATH"
+                (
+                    f"hint: put {status['path'].parent} before the real sbatch directory on PATH",
+                    curses.A_NORMAL,
+                )
             )
-        lines.append("Uninstall only removes a file containing the slurmctl marker.")
-        for idx, line in enumerate(lines):
-            attr = curses.A_BOLD if idx == 0 else curses.A_NORMAL
-            self.add(2 + idx, 2, line[: width - 4], attr)
+        lines.append(
+            ("Uninstall only removes a file containing the slurmctl marker.", curses.A_DIM)
+        )
+        for idx, (line, attr) in enumerate(lines):
+            self.add_row(2 + idx, width, " " + line, attr)
 
         action_row = 2 + len(lines) + 1
-        items = self.sbatch_wrapper_items()
-        self.clamp_selected(len(items))
-        start, visible = self.visible_slice(
-            items, self.content_rows(height, action_row)
-        )
-        for idx, item in enumerate(visible):
-            absolute_idx = start + idx
-            attr = (
-                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
-            )
-            self.add(
-                action_row + idx,
-                2,
-                f"{item['key']:<5} {item['name']:<14} {item['detail']}"[: width - 4],
-                attr,
-            )
+        self.draw_menu(self.sbatch_wrapper_items(), action_row, height, width)
 
     def draw_actions(self, height: int, width: int) -> None:
         record = getattr(self, "active_record", None) or {}
-        self.add(
-            2,
-            2,
-            f"Selected: {record.get('job_id') or '-'} {record.get('script_path') or '-'}"[
-                : width - 4
-            ],
-        )
-        items = self.action_items()
-        self.clamp_selected(len(items))
-        start, visible = self.visible_slice(items, self.content_rows(height, 4))
-        for idx, item in enumerate(visible):
-            absolute_idx = start + idx
-            attr = (
-                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
-            )
-            self.add(
-                idx + 4,
-                2,
-                f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4],
-                attr,
-            )
+        size = self.content_width(width) - 1
+        job_text = f"Selected: job {record.get('job_id') or '-'}  "
+        script = fit_text(record.get("script_path") or "-", max(0, size - len(job_text)), "middle")
+        self.add_row(2, width, " " + job_text + script)
+        self.draw_menu(self.action_items(), 4, height, width)
 
-    def watch_job_detail_rows(self, job: dict) -> tuple[str, list[str]]:
+    def watch_job_detail_rows(self, job: dict) -> tuple[str, list[tuple[str, str]]]:
         submission = job.get("submission") or self.find_submission_for_job(
             job.get("job_id")
         )
@@ -2440,59 +2740,61 @@ class InteractiveShell:
             f"Job {job.get('job_id') or '-'}  "
             f"{job.get('state') or '-'}  {job.get('job_name') or '-'}"
         )
-        rows = [
-            (
-                f"{'elapsed':<10} {job.get('elapsed') or '-':<12} "
-                f"{'requested':<10} {job.get('time_limit') or '-':<12} "
-                f"{'left':<6} {job.get('time_left') or '-'}"
-            ),
-            (
-                f"{'nodes':<10} {job.get('nodes') or '-':<12} "
-                f"{'reason':<10} {job.get('reason') or '-'}"
-            ),
+        fields = [
+            ("elapsed", str(job.get("elapsed") or "-")),
+            ("requested", str(job.get("time_limit") or "-")),
+            ("left", str(job.get("time_left") or "-")),
+            ("nodes", str(job.get("nodes") or "-")),
+            ("reason", str(job.get("reason") or "-")),
         ]
         if submission:
-            rows.append(f"{'script':<10} {submission.get('script_path') or '-'}")
-        return title, rows
+            fields.append(("script", str(submission.get("script_path") or "-")))
+        return title, fields
+
+    def watch_job_detail_lines(
+        self, fields: list[tuple[str, str]], inner: int
+    ) -> list[str]:
+        """Flow label/value pairs into as many columns as the box width allows."""
+        label_width = max(len(label) for label, _ in fields) + 1
+        short = [(label, value) for label, value in fields if label != "script"]
+        long_fields = [(label, value) for label, value in fields if label == "script"]
+        cell_target = label_width + 14
+        per_line = max(1, min(3, (inner + UI_COLUMN_GAP) // (cell_target + UI_COLUMN_GAP)))
+        cell_width = (inner - UI_COLUMN_GAP * (per_line - 1)) // per_line
+        lines = []
+        for offset in range(0, len(short), per_line):
+            chunk = short[offset : offset + per_line]
+            cells = []
+            for idx, (label, value) in enumerate(chunk):
+                is_last = idx == len(chunk) - 1
+                size = inner - (cell_width + UI_COLUMN_GAP) * idx if is_last else cell_width
+                text = f"{label:<{label_width}}{fit_text(value, max(0, size - label_width))}"
+                cells.append(text if is_last else text.ljust(cell_width))
+            lines.append((" " * UI_COLUMN_GAP).join(cells))
+        for label, value in long_fields:
+            lines.append(
+                f"{label:<{label_width}}{fit_text(value, max(0, inner - label_width), 'middle')}"
+            )
+        return lines
 
     def draw_watch_job_details(self, y: int, x: int, width: int, job: dict) -> int:
-        title, rows = self.watch_job_detail_rows(job)
-        box_width = max(20, width - x - 1)
+        title, fields = self.watch_job_detail_rows(job)
+        box_width = max(12, width - x - 1)
         inner_width = max(0, box_width - 2)
-        title_text = f" {title} "
-        border = "+" + ("-" * inner_width) + "+"
-        if len(title_text) < inner_width:
-            border = "+" + title_text + ("-" * (inner_width - len(title_text))) + "+"
+        text_width = max(0, inner_width - 2)
+        title_text = f" {fit_text(title, max(0, inner_width - 4))} "
+        border = "+-" + title_text + "-" * max(0, inner_width - len(title_text) - 1) + "+"
         self.add(y, x, border[:box_width], curses.A_BOLD)
-        for idx, row in enumerate(rows, start=1):
-            content = " " + row[: max(0, inner_width - 2)]
-            self.add(
-                y + idx,
-                x,
-                ("|" + content.ljust(inner_width) + "|")[:box_width],
-            )
-        self.add(y + len(rows) + 1, x, ("+" + ("-" * inner_width) + "+")[:box_width])
-        return y + len(rows) + 3
+        lines = self.watch_job_detail_lines(fields, text_width)
+        for idx, line in enumerate(lines, start=1):
+            self.add(y + idx, x, ("| " + line.ljust(text_width) + " |")[:box_width])
+        self.add(y + len(lines) + 1, x, ("+" + ("-" * inner_width) + "+")[:box_width])
+        return y + len(lines) + 3
 
     def draw_watch_actions(self, height: int, width: int) -> None:
         job = getattr(self, "active_job", None) or {}
-        action_start = self.draw_watch_job_details(2, 2, width, job)
-        items = self.watch_action_items()
-        self.clamp_selected(len(items))
-        start, visible = self.visible_slice(
-            items, self.content_rows(height, action_start)
-        )
-        for idx, item in enumerate(visible):
-            absolute_idx = start + idx
-            attr = (
-                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
-            )
-            self.add(
-                idx + action_start,
-                2,
-                f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4],
-                attr,
-            )
+        action_start = self.draw_watch_job_details(2, UI_GUTTER, width, job)
+        self.draw_menu(self.watch_action_items(), action_start, height, width)
 
     def draw_watch_multi_actions(self, height: int, width: int) -> None:
         count = len(self.active_watch_records)
@@ -2500,38 +2802,36 @@ class InteractiveShell:
             1 for job in self.active_watch_records if job.get("source") == "squeue"
         )
         captured_count = len(self.captured_records_for_jobs(self.active_watch_records))
-        self.add(
-            2,
-            2,
-            (
-                f"Selected: {count} jobs | cancelable: {live_count} | "
-                f"rerunnable: {captured_count}"
-            )[: width - 4],
+        summary = fit_segments(
+            [
+                (f"Selected: {count} jobs", 0),
+                (f"cancelable: {live_count}", 1),
+                (f"rerunnable: {captured_count}", 1),
+            ],
+            self.content_width(width) - 1,
         )
-        items = self.watch_multi_action_items()
-        self.clamp_selected(len(items))
-        start, visible = self.visible_slice(items, self.content_rows(height, 5))
-        for idx, item in enumerate(visible):
-            absolute_idx = start + idx
-            attr = (
-                curses.A_REVERSE if absolute_idx == self.selected else curses.A_NORMAL
-            )
-            self.add(
-                idx + 5,
-                2,
-                f"{item['key']:<5} {item['name']:<18} {item['detail']}"[: width - 4],
-                attr,
-            )
+        self.add_row(2, width, " " + summary)
+        self.draw_menu(self.watch_multi_action_items(), 4, height, width)
 
     def draw_confirm(self, height: int, width: int) -> None:
         items = self.confirm_items()
         self.clamp_selected(len(items))
         message = self.confirm_message or "Continue?"
-        box_width = min(max(44, len(message) + 6), max(20, width - 4))
-        box_height = 7
-        top = max(2, (height - box_height) // 2)
-        left = max(0, (width - box_width) // 2)
+        labels = [f" {item['key']} {item['name']} " for item in items]
+        options_width = sum(len(label) for label in labels) + 2 * (len(labels) - 1)
+        box_width = min(
+            max(44, len(message) + 6, options_width + 4), max(12, width - 2)
+        )
         inner_width = max(0, box_width - 2)
+        text_width = max(1, box_width - 4)
+        available = max(1, height - 2 - 7)
+        message_lines = textwrap.wrap(message, text_width) or [""]
+        if len(message_lines) > available:
+            message_lines = message_lines[:available]
+            message_lines[-1] = fit_text(message_lines[-1] + " " + ELLIPSIS, text_width)
+        box_height = 6 + len(message_lines)
+        top = max(1, (height - box_height) // 2)
+        left = max(0, (width - box_width) // 2)
 
         border = "+" + ("-" * inner_width) + "+"
         self.add(top, left, border)
@@ -2539,29 +2839,33 @@ class InteractiveShell:
             self.add(top + row, left, "|" + (" " * inner_width) + "|")
         self.add(top + box_height - 1, left, border)
         self.add(top + 1, left + 2, "Confirm", curses.A_BOLD)
-        self.add(top + 3, left + 2, message[: max(0, box_width - 4)])
+        for idx, line in enumerate(message_lines):
+            self.add(top + 3 + idx, left + 2, line)
 
         option_x = left + 2
-        for idx, item in enumerate(items):
-            label = f"{item['key']} {item['name']}"
+        option_y = top + box_height - 2
+        for idx, label in enumerate(labels):
             attr = curses.A_REVERSE if idx == self.selected else curses.A_NORMAL
-            self.add(top + 5, option_x, f" {label} ", attr)
-            option_x += len(label) + 5
+            if option_x + len(label) > left + box_width - 1:
+                label = fit_text(label, max(0, left + box_width - 1 - option_x))
+            self.add(option_y, option_x, label, attr)
+            option_x += len(label) + 2
 
     def draw_viewer(self, height: int, width: int) -> None:
         path = self.viewer_path
-        self.add(2, 2, str(path or "")[: width - 4], curses.A_BOLD)
+        size = self.content_width(width) - 1
+        self.add_row(2, width, " " + fit_text(str(path or ""), size, "middle"), curses.A_BOLD)
         if path is None:
-            self.add(4, 2, "No file selected."[: width - 4])
+            self.add_row(4, width, " No file selected.")
             return
         if self.viewer_error:
-            self.add(4, 2, self.viewer_error[: width - 4])
+            self.add_row(4, width, " " + self.viewer_error)
             return
         lines = self.viewer_lines
         if self.query:
             lines = [line for line in lines if self.query.lower() in line.lower()]
         for idx, line in enumerate(lines[: self.content_rows(height, 4)]):
-            self.add(idx + 4, 0, line[: width - 1])
+            self.add(idx + 4, UI_GUTTER + 1, line.expandtabs(4)[: max(0, size)])
 
     def load_viewer(self, path: Path) -> None:
         self.viewer_path = path

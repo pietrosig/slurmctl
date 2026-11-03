@@ -1568,6 +1568,9 @@ class Column:
     max_width: int | None = None
     flex: int = 0
     truncate: str = "end"
+    # When this column is next in line to be dropped, first try shrinking it
+    # to this width; only drop it if even that does not fit.
+    squeeze_width: int | None = None
 
 
 def layout_columns(
@@ -1589,8 +1592,13 @@ def layout_columns(
             size = min(size, column.max_width)
         natural[column.key] = size
 
+    squeezed: set[str] = set()
+
     def minimum(column: Column) -> int:
-        return min(column.min_width, natural[column.key])
+        floor = column.min_width
+        if column.key in squeezed and column.squeeze_width is not None:
+            floor = column.squeeze_width
+        return min(floor, natural[column.key])
 
     visible = list(columns)
 
@@ -1598,7 +1606,11 @@ def layout_columns(
         return sum(minimum(c) for c in visible) + gap * max(0, len(visible) - 1)
 
     while len(visible) > 1 and required() > width:
-        visible.remove(max(visible, key=lambda c: c.priority))
+        victim = max(visible, key=lambda c: c.priority)
+        if victim.squeeze_width is not None and victim.key not in squeezed:
+            squeezed.add(victim.key)
+            continue
+        visible.remove(victim)
 
     widths = {c.key: minimum(c) for c in visible}
     spare = max(0, width - required())
@@ -1651,17 +1663,20 @@ def render_column_header(
     return render_columns(layout, {c.key: c.label for c, _ in layout}, gap)
 
 
+# A min_width this large means "never narrower than the longest value".
+NEVER_TRUNCATE = 10**6
+
 WATCH_COLUMNS = [
-    Column("job_id", "JOB_ID", priority=0, min_width=8, max_width=14),
+    Column("job_id", "JOB_ID", priority=0, min_width=NEVER_TRUNCATE),
     Column("state", "STATE", priority=1, min_width=7, max_width=12),
     Column("elapsed", "ELAPSED", priority=3, min_width=7, max_width=11),
     Column("nodes", "NODES", priority=5, min_width=5, max_width=6),
-    Column("name", "NAME", priority=2, min_width=16, flex=3),
+    Column("name", "NAME", priority=2, min_width=16, flex=3, squeeze_width=8),
     Column("reason", "REASON", priority=4, min_width=12, flex=2),
 ]
 
 SUBMISSION_COLUMNS = [
-    Column("job_id", "JOB_ID", priority=0, min_width=6, max_width=14),
+    Column("job_id", "JOB_ID", priority=0, min_width=NEVER_TRUNCATE),
     Column("hash", "HASH", priority=4, min_width=8, max_width=8),
     Column("script", "SCRIPT", priority=1, min_width=10, flex=2, truncate="middle"),
     Column("out", "OUT", priority=2, min_width=12, flex=2, truncate="middle"),
@@ -1734,6 +1749,12 @@ class InteractiveShell:
         ]
 
     def run(self) -> int:
+        # Always use the terminal's real size. If LINES/COLUMNS are exported
+        # (some shells/terminals do), ncurses prefers them over the window
+        # size, pinning the layout to the startup size and ignoring later
+        # resizes such as zooming in VS Code.
+        os.environ.pop("LINES", None)
+        os.environ.pop("COLUMNS", None)
         try:
             return curses.wrapper(self._main)
         except KeyboardInterrupt:
@@ -1755,6 +1776,11 @@ class InteractiveShell:
                 self.dirty = False
             key = screen.getch()
             if key == -1:
+                continue
+            if key == curses.KEY_RESIZE:
+                curses.update_lines_cols()
+                screen.clear()
+                self.dirty = True
                 continue
             if key == 3:
                 return 0

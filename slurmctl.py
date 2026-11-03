@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-__version__ = "0.1.8"
+__version__ = "0.1.9"
 GITHUB_REPO = "pietrosig/slurmctl"
 RELEASE_ASSET_NAME = "slurmctl"
 LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
@@ -1281,6 +1281,17 @@ def watch_stats(jobs: list[dict]) -> dict[str, int]:
     return stats
 
 
+def watch_item_key(item: dict) -> str:
+    """Stable identity for a watch row across refreshes.
+
+    Uses the job id only: a job's source changes from squeue to sacct when it
+    finishes, but it is still the same job.
+    """
+    if is_watch_load_more_item(item):
+        return "load_more"
+    return f"job:{item.get('job_id') or ''}"
+
+
 def is_watch_load_more_item(job: dict) -> bool:
     return job.get("source") == "load_more"
 
@@ -2056,8 +2067,46 @@ class InteractiveShell:
             )
         self.watch_results.put(result)
 
+    def watch_selection_snapshot(self) -> tuple[list[str], int] | None:
+        """Selected row's key, then fallbacks (following rows, then preceding
+        ones), plus its offset from the top of the visible list."""
+        items = self.filtered_watch_jobs()
+        if not 0 <= self.selected < len(items):
+            return None
+        keys = [watch_item_key(item) for item in items]
+        ordered = (
+            [keys[self.selected]]
+            + keys[self.selected + 1 :]
+            + list(reversed(keys[: self.selected]))
+        )
+        return ordered, self.selected - self.scroll_top
+
+    def restore_watch_selection(self, snapshot: tuple[list[str], int] | None) -> None:
+        """Keep the same job selected, at the same screen row, after a refresh."""
+        if snapshot is None:
+            return
+        candidates, offset = snapshot
+        items = self.filtered_watch_jobs()
+        positions = {watch_item_key(item): idx for idx, item in reversed(list(enumerate(items)))}
+        for key in candidates:
+            if key == "job:":
+                continue
+            idx = positions.get(key)
+            if idx is not None:
+                self.selected = idx
+                self.scroll_top = max(0, idx - offset)
+                return
+        self.clamp_selected(len(items))
+
     def drain_watch_results(self) -> bool:
         changed = False
+        # Only anchor to a job once real data is on screen; before the first
+        # load the list holds just the "Load more" row.
+        snapshot = (
+            self.watch_selection_snapshot()
+            if self.view == "watch" and self.watch_cache
+            else None
+        )
         while True:
             try:
                 result = self.watch_results.get_nowait()
@@ -2086,6 +2135,8 @@ class InteractiveShell:
                     self.message = f"Refreshed watch from {result.source}"
             self.watch_refresh_announce = False
             changed = True
+        if changed:
+            self.restore_watch_selection(snapshot)
         return changed
 
     def clamp_selected(self, count: int) -> None:
@@ -2123,8 +2174,7 @@ class InteractiveShell:
             if 0 <= self.selected < len(items):
                 item = items[self.selected]
                 if not is_watch_load_more_item(item):
-                    key = f"{item.get('source') or ''}:{item.get('job_id') or ''}"
-                    self.panel_cursor_keys[panel] = key
+                    self.panel_cursor_keys[panel] = watch_item_key(item)
 
     def restore_panel_cursor(self, view: str, *, reset: bool = False) -> None:
         if reset:
@@ -2134,8 +2184,7 @@ class InteractiveShell:
             key = self.panel_cursor_keys.get(view)
             if key:
                 for idx, item in enumerate(self.filtered_watch_jobs()):
-                    item_key = f"{item.get('source') or ''}:{item.get('job_id') or ''}"
-                    if item_key == key:
+                    if watch_item_key(item) == key:
                         self.selected = idx
                         break
         self.clear_watch_visual()

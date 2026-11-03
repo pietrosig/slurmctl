@@ -27,7 +27,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-__version__ = "0.1.7"
+__version__ = "0.1.8"
 GITHUB_REPO = "pietrosig/slurmctl"
 RELEASE_ASSET_NAME = "slurmctl"
 LATEST_RELEASE_API_URL = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
